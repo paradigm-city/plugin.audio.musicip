@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings>
+    <category label="General">
+        <setting id="playlist_size" type="number" label="Playlist size (tracks)" default="20" />
+        <setting id="timeout" type="number" label="HTTP timeout (seconds)" default="10" />
+    </category>
+    <category label="MusicIP server">
+        <setting id="host" type="text" label="Host" default="localhost" />
+        <setting id="port" type="number" label="Port" default="10002" />
+    </category>
+</settings>

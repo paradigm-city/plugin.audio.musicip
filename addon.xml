@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.audio.musicip"
+       name="MusicIP"
+       version="1.0.8"
+       provider-name="OpenAI">
+  <requires>
+    <import addon="xbmc.python" version="3.0.0" />
+  </requires>
+
+  <extension point="xbmc.python.pluginsource" library="main.py">
+    <provides>audio</provides>
+  </extension>
+
+  <extension point="xbmc.addon.metadata">
+    <summary lang="en_GB">Create controlled MusicIP mixes from the full path of the currently playing song.</summary>
+    <description lang="en_GB">Uses a local MusicIP server to generate a mix from the full path of the current song, shows the result as a music folder, caches the last result, refreshes only from the context menu, and opens settings without triggering playback.</description>
+    <platform>all</platform>
+    <license>MIT</license>
+    <language>en</language>
+    <source>local</source>
+  </extension>
+</addon>
