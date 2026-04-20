@@ -10,6 +10,7 @@ Kodi music add-on that takes the currently playing audio track as the seed, call
 - Playlist size is configurable in add-on settings
 - Shows a folder view with one entry per returned track so the user can play a single song
 - Includes **Refresh mix** in the context menu to request a new mix for the same seed
+- Includes **Remove from mix** in the context menu to remove a track from the stored current mix
 
 ## Settings
 
@@ -35,6 +36,12 @@ Kodi music add-on that takes the currently playing audio track as the seed, call
 - When a list item path is set in Kodi, the add-on also writes the same value into the corresponding `MusicInfoTag` URL field.
 - The add-on now also writes artist and album into the corresponding `MusicInfoTag` when Kodi can resolve that metadata from the current player or the music library.
 
+
+## Version 1.0.9
+
+- Added **Remove from mix** to the context menu of each track in the mix view.
+- Removing a track updates the stored current mix instead of requesting a new one.
+- Reloading the view after removing a track uses the updated cached mix, so the mix is not regenerated unintentionally.
 
 ## Version 1.0.8
 
