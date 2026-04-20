@@ -108,7 +108,6 @@ def save_mix(seed: str, size: int, tracks: list[str]) -> None:
         handle.close()
 
 
-
 def load_mix(seed: str, size: int) -> list[str]:
     path = mix_cache_path(seed, size)
     if not xbmcvfs.exists(path):
@@ -120,11 +119,7 @@ def load_mix(seed: str, size: int) -> list[str]:
     finally:
         handle.close()
 
-    tracks = [line.strip() for line in payload.splitlines() if line.strip()]
-    if not tracks:
-        raise MusicIPError("Stored mix is empty.")
-    return tracks
-
+    return [line.strip() for line in payload.splitlines() if line.strip()]
 
 
 def get_current_seed_song() -> str:
@@ -203,18 +198,56 @@ def new_nonce() -> str:
 
 
 
+def build_browse_url(seed: str, size: int, refresh: bool = False) -> str:
+    query = {
+        "action": "browse_mix",
+        "seed": seed,
+        "size": str(size),
+        "nonce": new_nonce(),
+    }
+    if refresh:
+        query["refresh"] = "1"
+    return addon_url(**query)
+
+
 def build_refresh_action(seed: str, size: int) -> str:
-    refresh_url = addon_url(
-        action="browse_mix",
+    return f"Container.Update({build_browse_url(seed, size, refresh=True)},replace)"
+
+
+def build_remove_action(seed: str, size: int, index: int, path: str) -> str:
+    remove_url = addon_url(
+        action="remove_track",
         seed=seed,
         size=str(size),
-        refresh="1",
+        index=str(index),
+        path=path,
         nonce=new_nonce(),
     )
-    return f"Container.Update({refresh_url},replace)"
+    return f"RunPlugin({remove_url})"
 
 
+def remove_track_from_mix(seed: str, size: int, index: int, path: str) -> str:
+    tracks = load_mix(seed, size)
+    if not tracks:
+        raise MusicIPError("Stored mix is already empty.")
 
+    removed_path = ""
+
+    if 0 <= index < len(tracks):
+        if not path or tracks[index] == path:
+            removed_path = tracks.pop(index)
+
+    if not removed_path and path:
+        for pos, track in enumerate(tracks):
+            if track == path:
+                removed_path = tracks.pop(pos)
+                break
+
+    if not removed_path:
+        raise MusicIPError("Could not remove the selected item from the stored mix.")
+
+    save_mix(seed, size, tracks)
+    return removed_path
 
 
 def get_current_music_tag() -> object | None:
@@ -429,7 +462,7 @@ def apply_music_path(list_item: xbmcgui.ListItem, path: str) -> None:
     except Exception:
         pass
 
-def add_track_item(seed: str, size: int, path: str) -> None:
+def add_track_item(seed: str, size: int, index: int, path: str) -> None:
     metadata = get_track_metadata(path)
     label = metadata['title'] or path_to_label(path)
     list_item = xbmcgui.ListItem(label=label, offscreen=True)
@@ -443,8 +476,10 @@ def add_track_item(seed: str, size: int, path: str) -> None:
     apply_music_path(list_item, path)
 
     refresh_action = build_refresh_action(seed, size)
+    remove_action = build_remove_action(seed, size, index, path)
     list_item.addContextMenuItems([
         ("Refresh mix", refresh_action),
+        ("Remove from mix", remove_action),
     ])
 
     url = addon_url(
@@ -517,8 +552,14 @@ def browse_mix(seed: str, size: int, force_refresh: bool = False, update_listing
         xbmcplugin.endOfDirectory(HANDLE, succeeded=False, updateListing=update_listing, cacheToDisc=False)
         return
 
-    for path in tracks:
-        add_track_item(seed, size, path)
+    if not tracks:
+        info_label = "Mix is empty. Use Refresh mix to generate a new one."
+        info_item = xbmcgui.ListItem(label=info_label, offscreen=True)
+        apply_music_metadata(info_item, info_label)
+        xbmcplugin.addDirectoryItem(HANDLE, "", info_item, isFolder=False)
+    else:
+        for index, path in enumerate(tracks):
+            add_track_item(seed, size, index, path)
 
     xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing, cacheToDisc=False)
 
@@ -570,6 +611,30 @@ def router() -> None:
             xbmcplugin.setResolvedUrl(HANDLE, False, xbmcgui.ListItem())
             return
         play_track(path)
+        return
+
+    if action == "remove_track":
+        seed = params.get("seed", "").strip()
+        if not seed:
+            notify("No seed song was supplied.", xbmcgui.NOTIFICATION_ERROR)
+            return
+
+        size = int(params.get("size") or get_playlist_size())
+        try:
+            index = int(params.get("index", "-1"))
+        except (TypeError, ValueError):
+            index = -1
+        path = params.get("path", "")
+
+        try:
+            removed_path = remove_track_from_mix(seed, size, index, path)
+        except MusicIPError as exc:
+            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            log(str(exc), xbmc.LOGERROR)
+            return
+
+        notify(f"Removed: {path_to_label(removed_path)}")
+        xbmc.executebuiltin(f"Container.Update({build_browse_url(seed, size)},replace)")
         return
 
     if action == "open_settings":
