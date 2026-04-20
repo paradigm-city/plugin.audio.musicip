@@ -162,7 +162,44 @@ def decode_response(data: bytes) -> str:
 
 
 
+def seed_song_exists(seed_song: str) -> bool:
+    seed_song = (seed_song or '').strip()
+    if not seed_song:
+        return False
+
+    try:
+        if xbmcvfs.exists(seed_song):
+            return True
+    except Exception:
+        pass
+
+    try:
+        translated = xbmcvfs.translatePath(seed_song)
+    except Exception:
+        translated = seed_song
+
+    if translated and translated != seed_song:
+        try:
+            if xbmcvfs.exists(translated):
+                return True
+        except Exception:
+            pass
+        try:
+            return os.path.exists(translated)
+        except Exception:
+            return False
+
+    try:
+        return os.path.exists(seed_song)
+    except Exception:
+        return False
+
+
+
 def fetch_mix(seed_song: str, size: int) -> list[str]:
+    if not seed_song_exists(seed_song):
+        raise MusicIPError(f"Seed song does not exist: {seed_song}")
+
     url = build_musicip_url(seed_song, size)
     timeout = get_timeout()
     log(f"Requesting MusicIP mix: {url}")
