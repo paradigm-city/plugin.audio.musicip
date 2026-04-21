@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <addon id="plugin.audio.musicip"
        name="MusicIP"
-       version="1.0.9"
+       version="1.0.12"
        provider-name="paradigm_city">
   <requires>
     <import addon="xbmc.python" version="3.0.0" />
@@ -11,12 +11,20 @@
     <provides>audio</provides>
   </extension>
 
+  <extension point="kodi.context.item">
+    <menu id="kodi.core.main">
+      <item library="context_mix.py">
+        <label>Create MusicIP mix</label>
+        <visible>String.IsEqual(ListItem.DBTYPE,song)</visible>
+      </item>
+    </menu>
+  </extension>
+
   <extension point="xbmc.addon.metadata">
-    <summary lang="en_GB">Create MusicIP mixes from the full path of the currently playing song.</summary>
-    <description lang="en_GB">Uses a local MusicIP server to generate a mix from the full path of the current song, shows the result as a music folder, caches the last result, refreshes only from the context menu, and opens settings without triggering playback.</description>
+    <summary lang="en_GB">Create MusicIP mixes from the current song or from a song selected in the music library.</summary>
+    <description lang="en_GB">Uses a local MusicIP server to generate mixes from the full path of the currently playing song or from a song selected through the music library context menu. Shows the result as a music folder, caches the last result per seed and size, supports controlled refresh from the context menu, includes the seed song as the first track without duplication, preserves the generated mix order, and lets you remove tracks from the stored mix.</description>
     <platform>all</platform>
     <license>MIT</license>
     <language>en</language>
-    <source>local</source>
   </extension>
 </addon>

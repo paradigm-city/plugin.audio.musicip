@@ -161,6 +161,25 @@ def decode_response(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def normalize_track_identity(path: str) -> str:
+    return (path or "").replace("\\", "/").strip()
+
+
+def prepend_seed_track(seed_song: str, tracks: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for track in [seed_song] + list(tracks):
+        cleaned = (track or "").strip()
+        normalized = normalize_track_identity(cleaned)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(cleaned)
+
+    return result
+
+
 
 def fetch_mix(seed_song: str, size: int) -> list[str]:
     url = build_musicip_url(seed_song, size)
@@ -182,7 +201,7 @@ def fetch_mix(seed_song: str, size: int) -> list[str]:
     if not tracks:
         raise MusicIPError("MusicIP returned an empty mix.")
 
-    return tracks
+    return prepend_seed_track(seed_song, tracks)
 
 
 
@@ -533,7 +552,7 @@ def show_root() -> None:
 def browse_mix(seed: str, size: int, force_refresh: bool = False, update_listing: bool = False) -> None:
     xbmcplugin.setPluginCategory(HANDLE, f"MusicIP mix: {path_to_label(seed)}")
     xbmcplugin.setContent(HANDLE, "songs")
-    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_TITLE)
+    xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_UNSORTED)
 
     try:
         if force_refresh:
