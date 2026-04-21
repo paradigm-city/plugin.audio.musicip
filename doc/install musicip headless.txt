@@ -1,0 +1,143 @@
+https://www.spicefly.com/article.php?page=musicip-headless-windows10
+
+c:
+cd C:\Program Files (x86)\MusicIP\MusicIP Mixer
+MusicMagicServer.exe install
+
+net start "MusicIP Server"
+
+http://localhost:10002/ 
+
+
+Spicefly
+Where to start
+
+MusicIP
+
+MusicIP Headless - Install on Windows 10
+Why use Headless mode?
+Using Headless mode is primarily used if you use other programs or hardware devices with MusicIP, such as Squeezebox. It allows MusicIP to run in the background as a service without the requirement of having the GUI interface open to utilise its functionality. 
+You only then need to bring up the GUI interface for advanced functions such as archiving analysis within a music file. 
+How to install MusicIP in Headless mode on Windows 10
+Assumptions
+MusicIP Version 1.9 
+
+Note there is a difference between 32/64bit Windows Versions and the Program Files directory. 
+
+For 64bit it's; Program Files (x86) 
+Therefore MusicIP will install at this default file location;
+C:\Program Files (x86)\MusicIP\MusicIP Mixer 
+My Login User name is Spicefly
+
+The first part, follows exactly the same process as for installing on XP etc. We are working on the assumption that you have already installed MusicIP and worked out how to scan your music and now want to install MusicIP headless mode. 
+
+If you havent touched MusicIP before, then download it from MusicIP Software 
+
+Install with the default settings. 
+Allow MusicIP to analyse the music collection. 
+Turn off the Service Settings in the main GUI 
+File -> Preferences -> Services 
+Untick all settings and change Services Port to 10003 
+
+This now ensures that the GUI side of MusicIP doesn't interfere with the headless mode. 
+
+ 
+
+
+Installing the Headless Mode 
+
+
+Screenshots are for Windows 10. You >> MUST << run the Command Prompt in Administrator Mode. 
+
+Start Menu -> Windows System -> Command Prompt -> DONT CLICK IT. RIGHT CLICK AND SELECT "Run as Administrator" 
+
+
+ 
+
+Change the directory to your installation of MusicIP, directory; C:\Program Files (x86)\MusicIP\MusicIP Mixer. 
+
+See below image for what to type, note that the cd * is a shortcut. 
+If you find you are in the wrong folder, enter; cd MusicIP followed by; cd MusicIP Mixer 
+For more information on basic DOS commands see this tutorial 
+
+
+ 
+
+
+IF YOU DO NOT get MusicIP Server is now installed, then double check that you are running in Administrator Mode and try disabling UAC. 
+
+Now start the MusicIP Server service type; services.msc in the text box on the Start Menu. 
+
+ 
+
+Now ensure it has installed and is running; 
+
+From a Web Browser type; http://localhost:10002/ 
+
+You should get the interface come up. 
+
+ 
+
+Note that the Total songs is 0 this is because the caches are not aligned between the GUI and the Headless mode. 
+How to tie Headless with the GUI
+Configuration of the Headless mode is done via a text file named mmm.ini 
+
+Held in the directory; 
+
+C:\Program Files (x86)\MusicIP\MusicIP Mixer 
+
+Download mmm.ini file here 
+
+Save this as a text file and put it into the directory; 
+
+C:\Program Files (x86)\MusicIP\MusicIP Mixer 
+
+Now the configuration part 
+
+Here is an extract of the mmm.ini file showing the important bits; 
+
+[services] 
+key= 
+cache=c:\Users\user\AppData\Roaming\MusicIP\MusicIP mixer\default.m3lib 
+port=10002 
+tivo=0 
+upnp=0 
+api=1 
+
+The Two most important lines; 
+CACHE=Must point to the cache file that the MusicIP GUI is using. In my example I'm logged in as Spicefly. 
+
+If your login is FRED then the cache line would be; 
+
+cache=c:\Users\FRED\AppData\Roaming\MusicIP\MusicIP mixer\default.m3lib 
+
+PORT= This is the port that the headless will listen on, the default is 10002 
+
+You may wish to download my replacement interface for MusicIP which we use for the rest of this tutorial to check functionality. 
+
+
+Replacement MusicIP Interface 
+
+Now restart the MusicIP service.
+
+Open a web browser and check again. 
+
+http://localhost:10002/ 
+
+The count of the songs should now match the GUI.
+
+
+ 
+
+Scroll down to Test Mix and Click the Test Mix Creation, you should now receive a list of songs. 
+
+Congratulations MusicIP is now running in Headless mode and you do not need to have the GUI open to produce mixes! 
+
+
+ADDITIONAL maybe required 
+It has been reported that the GUI needs to be changed to run in Administrator mode so that the cache is updated correctly. I did some very quick and limited testing and I didnt need to do this, but please try it if you are having problems.  Especially if you are using EAC (If you are prompted a lot with security warnings when you do administrator tasks then you probably have this enabled.  Use google for further info) 
+
+On the desktop, Right Click the MusicIP Mixer icon and select Properties 
+Tick the boxes as shown below, Compatibility mode and Privilege Level, Click Ok and try again! 
+
+
