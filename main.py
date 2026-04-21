@@ -269,6 +269,25 @@ def remove_track_from_mix(seed: str, size: int, index: int, path: str) -> str:
     return removed_path
 
 
+
+
+def is_addon_mix_container_active() -> bool:
+    try:
+        plugin_name = (xbmc.getInfoLabel("Container.PluginName") or "").strip()
+        folder_path = (xbmc.getInfoLabel("Container.FolderPath") or "").strip()
+    except Exception:
+        return False
+
+    if plugin_name == ADDON_ID:
+        return True
+
+    return folder_path.startswith(f"plugin://{ADDON_ID}/")
+
+
+def ensure_remove_allowed_from_addon_container() -> None:
+    if not is_addon_mix_container_active():
+        raise MusicIPError("Remove from mix is only available inside the MusicIP add-on.")
+
 def get_current_music_tag() -> object | None:
     try:
         player = xbmc.Player()
@@ -646,6 +665,7 @@ def router() -> None:
         path = params.get("path", "")
 
         try:
+            ensure_remove_allowed_from_addon_container()
             removed_path = remove_track_from_mix(seed, size, index, path)
         except MusicIPError as exc:
             notify(str(exc), xbmcgui.NOTIFICATION_ERROR)

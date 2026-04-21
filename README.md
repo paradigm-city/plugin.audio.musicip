@@ -13,6 +13,7 @@ Kodi music add-on that can build a MusicIP mix from the currently playing song o
 - Shows a folder view with one entry per returned track so the user can play a single song
 - Keeps the mix **unsorted** so the displayed order matches the generated mix
 - Includes **Refresh mix** in the context menu to request a new mix for the same seed
+- Uses a custom add-on icon via `icon.png` referenced from `addon.xml` metadata
 - Includes **Remove from mix** in the context menu to remove a track from the stored current mix
 - Always includes the **seed song as the first track** and removes duplicate occurrences of that seed from the rest of the mix
 
@@ -46,12 +47,20 @@ Kodi music add-on that can build a MusicIP mix from the currently playing song o
 
 ## Notes
 
+- `Remove from mix` is only available from within the MusicIP add-on view.
+
 - The add-on uses the song title from Kodi metadata when available.
 - If no title tag is available, it falls back to the current filename without extension.
 - The refresh action forces the add-on to request a new mix for the same seed.
 - If the MusicIP server returns deterministic results for the same seed, the refreshed mix may still be identical.
 - When a list item path is set in Kodi, the add-on also writes the same value into the corresponding `MusicInfoTag` URL field.
 - The add-on also writes artist and album into the corresponding `MusicInfoTag` when Kodi can resolve that metadata from the current player or the music library.
+
+## Version 1.0.13
+
+- Added a bundled `icon.png` for the add-on package.
+- `Remove from mix` is now enforced to work only from within the MusicIP add-on container.
+- If the action is triggered from outside the add-on, it is rejected with a user-facing message.
 
 ## Version 1.0.12
 
@@ -81,3 +90,4 @@ Kodi music add-on that can build a MusicIP mix from the currently playing song o
 ## Version 1.0.7
 
 - Fixed Kodi JSON-RPC song metadata lookup: uses `filename` as the `AudioLibrary.GetSongs` filter field and matches the returned `file` property against the full path.
+
