@@ -47,8 +47,6 @@ Kodi music add-on that can build a MusicIP mix from the currently playing song o
 
 ## Notes
 
-- `Remove from mix` is only available from within the MusicIP add-on view.
-
 - The add-on uses the song title from Kodi metadata when available.
 - If no title tag is available, it falls back to the current filename without extension.
 - The refresh action forces the add-on to request a new mix for the same seed.
