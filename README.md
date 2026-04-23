@@ -8,7 +8,10 @@ Kodi music add-on that can build a MusicIP mix from the currently playing song o
 - Can use the **currently playing audio** as the seed song
 - Can open **Create MusicIP mix** from the **context menu of library songs**
 - The library context-menu entry reads the seed with `getMusicInfoTag().getURL()`
-- Calls MusicIP at `http://localhost:10002/api/mix`
+- requires MusicIPServer Software installed
+- Kodi and MusicIP Libraries should by in sync (as much as possible)  
+- Calls MusicIP at `http://<host>:<port>/api/mix`
+- Host and port are configurable in add-on settings
 - Playlist size is configurable in add-on settings
 - Shows a folder view with one entry per returned track so the user can play a single song
 - Keeps the mix **unsorted** so the displayed order matches the generated mix
@@ -30,7 +33,8 @@ Kodi music add-on that can build a MusicIP mix from the currently playing song o
 2. Zip that folder itself, not only its contents.
 3. In Kodi, go to **Add-ons** -> **Install from ZIP file**.
 4. Install the zip.
-5. Open **Music** -> **Music add-ons** -> **MusicIP**.
+5. Install and configure MusicIPMixer software
+6. Open **Music** -> **Music add-ons** -> **MusicIP**.
 
 ## Usage
 
