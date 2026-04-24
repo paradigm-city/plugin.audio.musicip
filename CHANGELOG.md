@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## Version 1.0.22
+
+- Added album artwork support for mix track entries.
+- Kodi library metadata lookup now requests `thumbnail` and `fanart` in addition to title, artist, album, and file data.
+- Track list items now receive `thumb`, `icon`, and, when available, `fanart` artwork through `ListItem.setArt(...)`.
+- Playback paths remain unchanged and still use the original MusicIP path.
+
 ## Version 1.0.21
 
 - Split the documentation into two files:

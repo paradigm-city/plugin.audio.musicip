@@ -670,7 +670,7 @@ def query_library_songs_by_filename(filename: str) -> list[dict]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file', 'thumbnail', 'fanart'],
                 'filter': {'field': 'filename', 'operator': 'is', 'value': filename},
             },
         )
@@ -703,7 +703,7 @@ def query_library_songs_strict(filename: str, directory: str) -> list[dict]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file', 'thumbnail', 'fanart'],
                 'filter': {'and': filters},
             },
         )
@@ -732,6 +732,8 @@ def extract_song_metadata(song: dict) -> dict[str, str]:
         'title': str(song.get('title') or '').strip(),
         'artist': artist_value,
         'album': str(song.get('album') or '').strip(),
+        'thumbnail': str(song.get('thumbnail') or '').strip(),
+        'fanart': str(song.get('fanart') or '').strip(),
     }
 
 
@@ -769,6 +771,8 @@ def get_track_metadata(path: str) -> dict[str, str]:
         'title': path_to_label(path),
         'artist': '',
         'album': '',
+        'thumbnail': '',
+        'fanart': '',
     }
 
     current_data = get_current_player_metadata(path)
@@ -809,6 +813,29 @@ def apply_music_path(list_item: xbmcgui.ListItem, path: str) -> None:
         pass
 
 
+def apply_music_artwork(
+    list_item: xbmcgui.ListItem,
+    thumbnail: str = '',
+    fanart: str = '',
+) -> None:
+    art: dict[str, str] = {}
+
+    if thumbnail:
+        art['thumb'] = thumbnail
+        art['icon'] = thumbnail
+
+    if fanart:
+        art['fanart'] = fanart
+
+    if not art:
+        return
+
+    try:
+        list_item.setArt(art)
+    except Exception:
+        pass
+
+
 def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str = '') -> None:
     metadata = get_track_metadata(path)
     label = metadata['title'] or path_to_label(path)
@@ -821,6 +848,11 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
         album=metadata.get('album', ''),
     )
     apply_music_path(list_item, path)
+    apply_music_artwork(
+        list_item,
+        thumbnail=metadata.get('thumbnail', ''),
+        fanart=metadata.get('fanart', ''),
+    )
 
     refresh_action = build_refresh_action(seed, size, cache_path=cache_path)
     remove_action = build_remove_action(seed, size, index, path, cache_path=cache_path)
@@ -1059,6 +1091,11 @@ def play_track(path: str) -> None:
         album=metadata.get('album', ''),
     )
     apply_music_path(list_item, path)
+    apply_music_artwork(
+        list_item,
+        thumbnail=metadata.get('thumbnail', ''),
+        fanart=metadata.get('fanart', ''),
+    )
     xbmcplugin.setResolvedUrl(HANDLE, True, list_item)
 
 
