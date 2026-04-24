@@ -1,6 +1,6 @@
 # MusicIP Kodi Add-on
 
-Kodi music add-on that takes the currently playing audio track as the seed, calls a local MusicIP server, and shows the resulting mix as a folder-like listing.
+Kodi music add-on that can create a mix from the currently playing audio track or from a song selected in the Kodi music library, using a local MusicIP server.
 
 ## Features
 
