@@ -9,7 +9,8 @@ import json
 import os
 import sys
 import time
-from urllib.parse import parse_qsl, quote_from_bytes, urlencode
+import unicodedata
+from urllib.parse import parse_qsl, quote_from_bytes, urlencode, unquote
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
 
@@ -583,19 +584,106 @@ def build_path_candidates(directory: str) -> list[str]:
     return candidates
 
 
+def canonical_audio_path(path: str) -> str:
+    value = (path or "").strip()
+    value = unquote(value)
+    value = unicodedata.normalize("NFC", value)
+    value = value.replace("\\", "/")
+
+    if "://" in value:
+        scheme, rest = value.split("://", 1)
+        while "//" in rest:
+            rest = rest.replace("//", "/")
+        value = f"{scheme.lower()}://{rest}"
+    else:
+        while "//" in value:
+            value = value.replace("//", "/")
+
+    return value.rstrip("/").casefold()
+
+
+def basename_key(path: str) -> str:
+    value = canonical_audio_path(path)
+    slash_pos = value.rfind("/")
+    return value[slash_pos + 1:] if slash_pos >= 0 else value
+
+
+def tail_key(path: str, segments: int = 3) -> str:
+    value = canonical_audio_path(path)
+    parts = [part for part in value.split("/") if part]
+    if not parts:
+        return ""
+    return "/".join(parts[-segments:])
+
+
 def find_song_by_file(songs: list[dict], path: str) -> dict | None:
-    normalized_path = path.replace('\\', '/').strip()
+    target = canonical_audio_path(path)
+
     for song in songs:
-        song_file = str(song.get('file') or '').replace('\\', '/').strip()
-        if song_file == normalized_path:
+        song_file = canonical_audio_path(str(song.get("file") or ""))
+        if song_file == target:
             return song
+
     return None
 
 
-def get_library_track_metadata(path: str) -> dict[str, str]:
-    filename, directory = split_full_path(path)
+def find_song_by_file_relaxed(songs: list[dict], path: str) -> dict | None:
+    matched_song = find_song_by_file(songs, path)
+    if matched_song is not None:
+        return matched_song
+
+    target_base = basename_key(path)
+    basename_matches = [
+        song for song in songs
+        if basename_key(str(song.get("file") or "")) == target_base
+    ]
+    if len(basename_matches) == 1:
+        return basename_matches[0]
+
+    target_tail = tail_key(path, segments=3)
+    suffix_matches: list[dict] = []
+    for song in songs:
+        song_file = canonical_audio_path(str(song.get("file") or ""))
+        if target_tail and song_file.endswith(target_tail):
+            suffix_matches.append(song)
+
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+
+    return None
+
+
+def log_library_candidates(path: str, songs: list[dict]) -> None:
+    log(f"MusicIP path: {path!r}", xbmc.LOGDEBUG)
+    log(f"Canonical MusicIP path: {canonical_audio_path(path)!r}", xbmc.LOGDEBUG)
+    for song in songs:
+        file_value = str(song.get("file") or "")
+        log(f"Kodi candidate file: {file_value!r}", xbmc.LOGDEBUG)
+        log(f"Kodi candidate canonical: {canonical_audio_path(file_value)!r}", xbmc.LOGDEBUG)
+
+
+def query_library_songs_by_filename(filename: str) -> list[dict]:
     if not filename:
-        return {}
+        return []
+
+    try:
+        result = execute_jsonrpc(
+            'AudioLibrary.GetSongs',
+            {
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file'],
+                'filter': {'field': 'filename', 'operator': 'is', 'value': filename},
+            },
+        )
+    except Exception as exc:
+        log(f"Filename-only library lookup failed for {filename!r}: {exc}", xbmc.LOGDEBUG)
+        return []
+
+    return result.get('songs') or []
+
+
+def query_library_songs_strict(filename: str, directory: str) -> list[dict]:
+    if not filename:
+        return []
 
     filters: list[dict] = [
         {'field': 'filename', 'operator': 'is', 'value': filename},
@@ -615,34 +703,65 @@ def get_library_track_metadata(path: str) -> dict[str, str]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'album', 'file'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file'],
                 'filter': {'and': filters},
             },
         )
     except Exception as exc:
-        log(f'Library metadata lookup failed for {path}: {exc}', xbmc.LOGDEBUG)
-        return {}
+        log(f'Library metadata strict lookup failed for {filename!r}: {exc}', xbmc.LOGDEBUG)
+        return []
 
-    songs = result.get('songs') or []
-    log(f'Library lookup returned {len(songs)} candidate song(s) for {path}', xbmc.LOGDEBUG)
-    if not songs:
-        return {}
+    return result.get('songs') or []
 
-    matched_song = find_song_by_file(songs, path)
-    if matched_song is None:
-        return {}
 
-    artist_value = matched_song.get('artist') or ''
-    if isinstance(artist_value, list):
-        artist_value = ' / '.join(str(item).strip() for item in artist_value if str(item).strip())
-    else:
-        artist_value = str(artist_value).strip()
+def first_non_empty_text(value: object) -> str:
+    if isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return ' / '.join(parts)
+    return str(value or '').strip()
+
+
+def extract_song_metadata(song: dict) -> dict[str, str]:
+    artist_value = ''
+    for key in ('artist', 'displayartist', 'albumartist'):
+        artist_value = first_non_empty_text(song.get(key))
+        if artist_value:
+            break
 
     return {
-        'title': str(matched_song.get('title') or '').strip(),
+        'title': str(song.get('title') or '').strip(),
         'artist': artist_value,
-        'album': str(matched_song.get('album') or '').strip(),
+        'album': str(song.get('album') or '').strip(),
     }
+
+
+def get_library_track_metadata(path: str) -> dict[str, str]:
+    filename, directory = split_full_path(path)
+    if not filename:
+        return {}
+
+    strict_candidates = query_library_songs_strict(filename, directory)
+    log(f'Strict library lookup returned {len(strict_candidates)} candidate song(s) for {path}', xbmc.LOGDEBUG)
+
+    matched_song = find_song_by_file_relaxed(strict_candidates, path)
+    if matched_song is not None:
+        return extract_song_metadata(matched_song)
+
+    filename_candidates = query_library_songs_by_filename(filename)
+    log(f'Filename-only library lookup returned {len(filename_candidates)} candidate song(s) for {path}', xbmc.LOGDEBUG)
+
+    matched_song = find_song_by_file_relaxed(filename_candidates, path)
+    if matched_song is not None:
+        return extract_song_metadata(matched_song)
+
+    if strict_candidates:
+        log("No unique relaxed match found in strict library candidates.", xbmc.LOGDEBUG)
+        log_library_candidates(path, strict_candidates)
+    if filename_candidates:
+        log("No unique relaxed match found in filename-only library candidates.", xbmc.LOGDEBUG)
+        log_library_candidates(path, filename_candidates)
+
+    return {}
 
 
 def get_track_metadata(path: str) -> dict[str, str]:
@@ -657,14 +776,12 @@ def get_track_metadata(path: str) -> dict[str, str]:
         if value:
             metadata[key] = value
 
-    if not metadata['artist'] or not metadata['album']:
-        library_data = get_library_track_metadata(path)
-        for key, value in library_data.items():
-            if value and not metadata.get(key):
-                metadata[key] = value
+    library_data = get_library_track_metadata(path)
+    for key, value in library_data.items():
+        if value:
+            metadata[key] = value
 
     return metadata
-
 
 def apply_music_metadata(
     list_item: xbmcgui.ListItem,
