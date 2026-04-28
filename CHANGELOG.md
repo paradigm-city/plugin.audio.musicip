@@ -1,5 +1,46 @@
 # CHANGELOG
 
+## Version 1.0.27
+
+- Fixed the root menu when no audio is playing.
+- The root menu now always contains exactly three entries:
+  1. Generate mix from playing audio
+  2. Recent mixes
+  3. Settings
+- The message `No audio is currently playing` is no longer shown as a separate root-menu item.
+- If the user opens **Generate mix from playing audio** while no audio is playing, the add-on now shows a notification instead.
+
+## Version 1.0.26
+
+- Added detailed MusicIP HTTP error logging.
+- The add-on now logs the raw seed, encoded seed, request URL, playlist size, HTTP status, and HTTP error body when MusicIP returns an HTTP error.
+- Added URL-error logging for connection failures.
+- Rearranged the root menu so **Recent mixes** is item 2 of 3 and **Settings** is item 3 of 3.
+- The first root-menu entry is now **Generate mix from playing audio**.
+
+## Version 1.0.25
+
+- Added genre metadata from the Kodi music library when available.
+- Added decade metadata derived from the release year, e.g. `1990s` or `2010s`.
+- Genre is written to `MusicInfoTag` through `setGenres(...)` when available.
+- Decade is exposed as the add-on property `MusicIP.Decade` because Kodi has no native music-tag decade field.
+- The secondary label now shows decade, genre, and duration when available.
+- Genre and decade are metadata/display only and are not used for mix comparison or relation logic.
+
+## Version 1.0.24
+
+- Added release year display for mix entries.
+- Kodi library metadata lookup now requests `year`.
+- Year is written into the `MusicInfoTag` through `setYear(...)` when available.
+- The list item's secondary label now shows year and duration together when both are available.
+
+## Version 1.0.23
+
+- Added track duration display for mix entries.
+- Kodi library metadata lookup now requests `duration`.
+- Duration is written into the `MusicInfoTag` through `setDuration(...)` when available.
+- Duration is also shown as the list item's secondary label.
+
 ## Version 1.0.22
 
 - Added album artwork support for mix track entries.

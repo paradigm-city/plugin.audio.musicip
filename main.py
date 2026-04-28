@@ -351,16 +351,39 @@ def prepend_seed_track(seed_song: str, tracks: list[str]) -> list[str]:
 def fetch_mix(seed_song: str, size: int) -> list[str]:
     url = build_musicip_url(seed_song, size)
     timeout = get_timeout()
+
+    try:
+        encoded_seed = url.split("song=", 1)[1].split("&", 1)[0]
+    except Exception:
+        encoded_seed = ""
+
+    log(f"MusicIP seed raw: {seed_song!r}", xbmc.LOGDEBUG)
+    log(f"MusicIP seed encoded: {encoded_seed!r}", xbmc.LOGDEBUG)
+    log(f"MusicIP playlist size: {size}", xbmc.LOGDEBUG)
+    log(f"MusicIP request URL: {url!r}", xbmc.LOGDEBUG)
     log(f"Requesting MusicIP mix: {url}")
 
     try:
         with urlopen(url, timeout=timeout) as response:
             body = response.read()
     except HTTPError as exc:
+        try:
+            error_body = exc.read()
+        except Exception:
+            error_body = b""
+
+        log(f"MusicIP HTTP error {exc.code}", xbmc.LOGERROR)
+        log(f"MusicIP error URL: {url!r}", xbmc.LOGERROR)
+        log(f"MusicIP error seed raw: {seed_song!r}", xbmc.LOGERROR)
+        log(f"MusicIP error seed encoded: {encoded_seed!r}", xbmc.LOGERROR)
+        log(f"MusicIP error playlist size: {size}", xbmc.LOGERROR)
+        log(f"MusicIP error body: {error_body!r}", xbmc.LOGERROR)
         raise MusicIPError(f"MusicIP server returned HTTP {exc.code}.") from exc
     except URLError as exc:
+        log(f"MusicIP URL error for {url!r}: {exc}", xbmc.LOGERROR)
         raise MusicIPError(f"Could not reach MusicIP server at {get_server_host()}:{get_server_port()}.") from exc
     except Exception as exc:
+        log(f"MusicIP request failed for {url!r}: {exc}", xbmc.LOGERROR)
         raise MusicIPError(f"MusicIP request failed: {exc}") from exc
 
     text = decode_response(body)
@@ -526,6 +549,32 @@ def get_current_player_metadata(path: str | None = None) -> dict[str, str]:
     except Exception:
         pass
 
+    try:
+        year = parse_year(music_tag.getYear())
+        if year > 0:
+            data['year'] = year
+    except Exception:
+        pass
+
+    try:
+        genres = normalize_genres(music_tag.getGenres())
+        if genres:
+            data['genre'] = genres
+    except Exception:
+        try:
+            genres = normalize_genres(music_tag.getGenre())
+            if genres:
+                data['genre'] = genres
+        except Exception:
+            pass
+
+    try:
+        duration = parse_duration_seconds(music_tag.getDuration())
+        if duration > 0:
+            data['duration'] = duration
+    except Exception:
+        pass
+
     return data
 
 
@@ -670,7 +719,7 @@ def query_library_songs_by_filename(filename: str) -> list[dict]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file', 'thumbnail', 'fanart'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'thumbnail', 'fanart'],
                 'filter': {'field': 'filename', 'operator': 'is', 'value': filename},
             },
         )
@@ -703,7 +752,7 @@ def query_library_songs_strict(filename: str, directory: str) -> list[dict]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'file', 'thumbnail', 'fanart'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'thumbnail', 'fanart'],
                 'filter': {'and': filters},
             },
         )
@@ -721,6 +770,63 @@ def first_non_empty_text(value: object) -> str:
     return str(value or '').strip()
 
 
+def parse_duration_seconds(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_year(value: object) -> int:
+    try:
+        year = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+    if year <= 0:
+        return 0
+
+    return year
+
+
+def normalize_genres(value: object) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    text_value = str(value or '').strip()
+    if not text_value:
+        return []
+
+    return [text_value]
+
+
+def format_genres(value: object) -> str:
+    return ' / '.join(normalize_genres(value))
+
+
+def format_decade(year: int) -> str:
+    parsed_year = parse_year(year)
+    if parsed_year <= 0:
+        return ''
+
+    decade_start = (parsed_year // 10) * 10
+    return f"{decade_start}s"
+
+
+def format_duration(duration: int) -> str:
+    seconds = parse_duration_seconds(duration)
+    if seconds <= 0:
+        return ""
+
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+
+    return f"{minutes:d}:{seconds:02d}"
+
+
 def extract_song_metadata(song: dict) -> dict[str, str]:
     artist_value = ''
     for key in ('artist', 'displayartist', 'albumartist'):
@@ -728,10 +834,16 @@ def extract_song_metadata(song: dict) -> dict[str, str]:
         if artist_value:
             break
 
+    year_value = parse_year(song.get('year'))
+
     return {
         'title': str(song.get('title') or '').strip(),
         'artist': artist_value,
         'album': str(song.get('album') or '').strip(),
+        'genre': normalize_genres(song.get('genre')),
+        'year': year_value,
+        'decade': format_decade(year_value),
+        'duration': parse_duration_seconds(song.get('duration')),
         'thumbnail': str(song.get('thumbnail') or '').strip(),
         'fanart': str(song.get('fanart') or '').strip(),
     }
@@ -771,6 +883,10 @@ def get_track_metadata(path: str) -> dict[str, str]:
         'title': path_to_label(path),
         'artist': '',
         'album': '',
+        'genre': [],
+        'year': 0,
+        'decade': '',
+        'duration': 0,
         'thumbnail': '',
         'fanart': '',
     }
@@ -785,6 +901,10 @@ def get_track_metadata(path: str) -> dict[str, str]:
         if value:
             metadata[key] = value
 
+    metadata['genre'] = normalize_genres(metadata.get('genre'))
+    metadata['year'] = parse_year(metadata.get('year'))
+    metadata['decade'] = format_decade(metadata.get('year'))
+    metadata['duration'] = parse_duration_seconds(metadata.get('duration'))
     return metadata
 
 def apply_music_metadata(
@@ -792,6 +912,9 @@ def apply_music_metadata(
     title: str,
     artist: str = '',
     album: str = '',
+    year: int = 0,
+    duration: int = 0,
+    genres: object = None,
 ) -> None:
     try:
         music_tag = list_item.getMusicInfoTag()
@@ -800,6 +923,41 @@ def apply_music_metadata(
             music_tag.setArtist(artist)
         if album:
             music_tag.setAlbum(album)
+
+        genre_values = normalize_genres(genres)
+        if genre_values:
+            try:
+                music_tag.setGenres(genre_values)
+            except Exception:
+                pass
+
+        parsed_year = parse_year(year)
+        if parsed_year > 0:
+            try:
+                music_tag.setYear(parsed_year)
+            except Exception:
+                pass
+
+        duration_seconds = parse_duration_seconds(duration)
+        if duration_seconds > 0:
+            music_tag.setDuration(duration_seconds)
+    except Exception:
+        pass
+
+
+def apply_music_extra_properties(
+    list_item: xbmcgui.ListItem,
+    decade: str = '',
+    genres: object = None,
+) -> None:
+    decade_label = str(decade or '').strip()
+    genre_label = format_genres(genres)
+
+    try:
+        if decade_label:
+            list_item.setProperty('MusicIP.Decade', decade_label)
+        if genre_label:
+            list_item.setProperty('MusicIP.Genre', genre_label)
     except Exception:
         pass
 
@@ -836,6 +994,46 @@ def apply_music_artwork(
         pass
 
 
+def format_track_details(
+    year: int = 0,
+    decade: str = '',
+    genres: object = None,
+    duration: int = 0,
+) -> str:
+    parts: list[str] = []
+
+    decade_label = (decade or format_decade(year)).strip()
+    if decade_label:
+        parts.append(decade_label)
+
+    genre_label = format_genres(genres)
+    if genre_label:
+        parts.append(genre_label)
+
+    duration_label = format_duration(duration)
+    if duration_label:
+        parts.append(duration_label)
+
+    return " · ".join(parts)
+
+
+def apply_track_detail_display(
+    list_item: xbmcgui.ListItem,
+    year: int = 0,
+    decade: str = '',
+    genres: object = None,
+    duration: int = 0,
+) -> None:
+    label = format_track_details(year=year, decade=decade, genres=genres, duration=duration)
+    if not label:
+        return
+
+    try:
+        list_item.setLabel2(label)
+    except Exception:
+        pass
+
+
 def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str = '') -> None:
     metadata = get_track_metadata(path)
     label = metadata['title'] or path_to_label(path)
@@ -846,6 +1044,21 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
         label,
         artist=metadata.get('artist', ''),
         album=metadata.get('album', ''),
+        year=parse_year(metadata.get('year')),
+        duration=parse_duration_seconds(metadata.get('duration')),
+        genres=metadata.get('genre'),
+    )
+    apply_music_extra_properties(
+        list_item,
+        decade=str(metadata.get('decade') or ''),
+        genres=metadata.get('genre'),
+    )
+    apply_track_detail_display(
+        list_item,
+        year=parse_year(metadata.get('year')),
+        decade=str(metadata.get('decade') or ''),
+        genres=metadata.get('genre'),
+        duration=parse_duration_seconds(metadata.get('duration')),
     )
     apply_music_path(list_item, path)
     apply_music_artwork(
@@ -914,44 +1127,31 @@ def show_root() -> None:
     xbmcplugin.setPluginCategory(HANDLE, "MusicIP")
     xbmcplugin.setContent(HANDLE, "files")
 
+    generate_label = "Generate mix from playing audio"
+    generate_item = xbmcgui.ListItem(label=generate_label, offscreen=True)
+    apply_music_metadata(generate_item, generate_label)
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        addon_url(action="generate_current_mix"),
+        generate_item,
+        isFolder=True,
+    )
+
+    recent_item = xbmcgui.ListItem(label="Recent mixes", offscreen=True)
+    apply_music_metadata(recent_item, "Recent mixes")
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        build_saved_mixes_url(),
+        recent_item,
+        isFolder=True,
+    )
+
     settings_item = xbmcgui.ListItem(label="Settings", offscreen=True)
     apply_music_metadata(settings_item, "Settings")
     xbmcplugin.addDirectoryItem(
         HANDLE,
         addon_url(action="open_settings"),
         settings_item,
-        isFolder=True,
-    )
-
-    saved_item = xbmcgui.ListItem(label="Recent mixes", offscreen=True)
-    apply_music_metadata(saved_item, "Recent mixes")
-    xbmcplugin.addDirectoryItem(
-        HANDLE,
-        build_saved_mixes_url(),
-        saved_item,
-        isFolder=True,
-    )
-
-    try:
-        seed = get_current_seed_song()
-    except MusicIPError as exc:
-        info_item = xbmcgui.ListItem(label=str(exc), offscreen=True)
-        xbmcplugin.addDirectoryItem(HANDLE, "", info_item, isFolder=False)
-        xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
-        return
-
-    size = get_playlist_size()
-    label = f"Mix from current song: {path_to_label(seed)}"
-    folder_item = xbmcgui.ListItem(label=label, offscreen=True)
-    apply_music_metadata(folder_item, label)
-    folder_item.addContextMenuItems([
-        ("Refresh mix", build_refresh_action(seed, size)),
-    ])
-
-    xbmcplugin.addDirectoryItem(
-        HANDLE,
-        addon_url(action="browse_mix", seed=seed, size=str(size)),
-        folder_item,
         isFolder=True,
     )
 
@@ -1001,6 +1201,18 @@ def show_saved_mixes_by_date(date_key: str) -> None:
             log(f"Skipping invalid stored mix {cache_path}: {exc}", xbmc.LOGDEBUG)
 
     xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
+
+def generate_current_mix() -> None:
+    try:
+        seed = get_current_seed_song()
+    except MusicIPError as exc:
+        notify(str(exc), xbmcgui.NOTIFICATION_WARNING)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False, cacheToDisc=False)
+        return
+
+    size = get_playlist_size()
+    browse_mix(seed, size, force_refresh=False, update_listing=False)
+
 
 def browse_mix(seed: str, size: int, force_refresh: bool = False, update_listing: bool = False) -> None:
     xbmcplugin.setPluginCategory(HANDLE, f"MusicIP mix: {path_to_label(seed)}")
@@ -1089,6 +1301,21 @@ def play_track(path: str) -> None:
         label,
         artist=metadata.get('artist', ''),
         album=metadata.get('album', ''),
+        year=parse_year(metadata.get('year')),
+        duration=parse_duration_seconds(metadata.get('duration')),
+        genres=metadata.get('genre'),
+    )
+    apply_music_extra_properties(
+        list_item,
+        decade=str(metadata.get('decade') or ''),
+        genres=metadata.get('genre'),
+    )
+    apply_track_detail_display(
+        list_item,
+        year=parse_year(metadata.get('year')),
+        decade=str(metadata.get('decade') or ''),
+        genres=metadata.get('genre'),
+        duration=parse_duration_seconds(metadata.get('duration')),
     )
     apply_music_path(list_item, path)
     apply_music_artwork(
@@ -1157,6 +1384,10 @@ def router() -> None:
             return
         notify("Removed mix.")
         xbmc.executebuiltin(f"Container.Update({build_saved_mixes_url()},replace)")
+        return
+
+    if action == "generate_current_mix":
+        generate_current_mix()
         return
 
     if action == "browse_mix":
