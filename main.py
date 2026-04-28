@@ -7,6 +7,7 @@ import glob
 import hashlib
 import json
 import os
+import random
 import sys
 import time
 import unicodedata
@@ -143,6 +144,20 @@ def save_mix(seed: str, size: int, tracks: list[str]) -> None:
         "updated_ts": int(time.time()),
     }
     save_json_file(mix_meta_path_from_cache_path(path), meta)
+
+
+def save_mix_by_cache_path(cache_path: str, tracks: list[str]) -> None:
+    payload = "\n".join(tracks)
+    handle = xbmcvfs.File(cache_path, "w")
+    try:
+        handle.write(payload)
+    finally:
+        handle.close()
+
+    meta = get_saved_mix_metadata(cache_path, tracks)
+    meta["track_count"] = len(tracks)
+    meta["updated_ts"] = int(time.time())
+    save_json_file(mix_meta_path_from_cache_path(cache_path), meta)
 
 
 def load_mix(seed: str, size: int) -> list[str]:
@@ -450,6 +465,19 @@ def build_remove_action(seed: str, size: int, index: int, path: str, cache_path:
     return f"RunPlugin({remove_url})"
 
 
+def build_more_like_this_action(seed: str, size: int, index: int, path: str, cache_path: str = "") -> str:
+    more_url = addon_url(
+        action="more_like_this",
+        seed=seed,
+        size=str(size),
+        index=str(index),
+        path=path,
+        cache_path=cache_path,
+        nonce=new_nonce(),
+    )
+    return f"RunPlugin({more_url})"
+
+
 def remove_track_from_mix(seed: str, size: int, index: int, path: str, cache_path: str = "") -> str:
     target_cache_path = cache_path or mix_cache_path(seed, size)
     tracks = load_mix_by_cache_path(target_cache_path)
@@ -483,6 +511,73 @@ def remove_track_from_mix(seed: str, size: int, index: int, path: str, cache_pat
     meta["updated_ts"] = int(time.time())
     save_json_file(mix_meta_path_from_cache_path(target_cache_path), meta)
     return removed_path
+
+
+
+def get_more_like_this_target_size() -> int:
+    return max(1, round(get_playlist_size() * 0.20))
+
+
+def find_track_position(tracks: list[str], index: int, path: str) -> int:
+    if 0 <= index < len(tracks):
+        if not path or tracks[index] == path:
+            return index
+
+    normalized_path = normalize_track_identity(path)
+    if normalized_path:
+        for pos, track in enumerate(tracks):
+            if normalize_track_identity(track) == normalized_path:
+                return pos
+
+    if 0 <= index < len(tracks):
+        return index
+
+    return len(tracks) - 1
+
+
+def insert_more_like_this_into_mix(seed: str, size: int, index: int, path: str, cache_path: str = "") -> int:
+    if not path:
+        raise MusicIPError("No seed track was supplied for More like this.")
+
+    target_cache_path = cache_path or mix_cache_path(seed, size)
+    source_tracks = load_mix_by_cache_path(target_cache_path)
+    if not source_tracks:
+        raise MusicIPError("Stored mix is empty.")
+
+    insert_after = find_track_position(source_tracks, index, path)
+    if insert_after < 0:
+        raise MusicIPError("Could not locate the selected track in the source mix.")
+
+    target_count = get_more_like_this_target_size()
+    submix_tracks = fetch_mix(path, get_playlist_size())
+    random.shuffle(submix_tracks)
+
+    existing = {
+        normalize_track_identity(track)
+        for track in source_tracks
+        if normalize_track_identity(track)
+    }
+
+    new_tracks: list[str] = []
+    for track in submix_tracks:
+        cleaned = (track or "").strip()
+        normalized = normalize_track_identity(cleaned)
+        if not cleaned or not normalized or normalized in existing:
+            continue
+
+        existing.add(normalized)
+        new_tracks.append(cleaned)
+
+        if len(new_tracks) >= target_count:
+            break
+
+    if not new_tracks:
+        raise MusicIPError("No new tracks found for this song.")
+
+    insert_at = insert_after + 1
+    updated_tracks = source_tracks[:insert_at] + new_tracks + source_tracks[insert_at:]
+    save_mix_by_cache_path(target_cache_path, updated_tracks)
+    return len(new_tracks)
 
 
 def is_addon_mix_container_active() -> bool:
@@ -1068,9 +1163,11 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
     )
 
     refresh_action = build_refresh_action(seed, size, cache_path=cache_path)
+    more_like_this_action = build_more_like_this_action(seed, size, index, path, cache_path=cache_path)
     remove_action = build_remove_action(seed, size, index, path, cache_path=cache_path)
     list_item.addContextMenuItems([
         ("Refresh mix", refresh_action),
+        ("More like this", more_like_this_action),
         ("Remove from mix", remove_action),
     ])
 
@@ -1438,6 +1535,31 @@ def router() -> None:
             return
 
         notify(f"Removed: {path_to_label(removed_path)}")
+        if cache_path:
+            xbmc.executebuiltin(f"Container.Update({build_saved_browse_url(cache_path)},replace)")
+        else:
+            xbmc.executebuiltin(f"Container.Update({build_browse_url(seed, size)},replace)")
+        return
+
+    if action == "more_like_this":
+        seed = params.get("seed", "").strip()
+        size = int(params.get("size") or get_playlist_size())
+        try:
+            index = int(params.get("index", "-1"))
+        except (TypeError, ValueError):
+            index = -1
+        path = params.get("path", "")
+        cache_path = params.get("cache_path", "").strip()
+
+        try:
+            ensure_remove_allowed_from_addon_container()
+            inserted = insert_more_like_this_into_mix(seed, size, index, path, cache_path=cache_path)
+        except MusicIPError as exc:
+            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            log(str(exc), xbmc.LOGERROR)
+            return
+
+        notify(f"Inserted {inserted} track(s).")
         if cache_path:
             xbmc.executebuiltin(f"Container.Update({build_saved_browse_url(cache_path)},replace)")
         else:

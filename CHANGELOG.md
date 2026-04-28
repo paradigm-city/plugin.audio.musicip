@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## Version 1.0.28
+
+- Added **More like this** to track context menus inside MusicIP mix views.
+- The action generates a submix based on the selected track and inserts new tracks directly below it in the source mix.
+- The source mix is modified and saved immediately.
+- The submix request uses the configured full mix size, then shuffles the result locally.
+- New tracks are added until 20% of the configured mix size is reached.
+- Existing tracks in the source mix are skipped to avoid duplicates.
+- The action is guarded so it only works from within MusicIP add-on mix views.
+
 ## Version 1.0.27
 
 - Fixed the root menu when no audio is playing.
