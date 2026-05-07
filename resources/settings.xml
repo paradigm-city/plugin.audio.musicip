@@ -1,11 +1,17 @@
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <settings>
     <category label="General">
-        <setting id="playlist_size" type="number" label="Playlist size (tracks)" default="20" />
+                <setting id="plugin_extended_logging" type="bool" label="Extended plugin logging" default="false" />
+<setting id="playlist_size" type="number" label="Playlist size (tracks)" default="20" />
         <setting id="timeout" type="number" label="HTTP timeout (seconds)" default="10" />
     </category>
     <category label="MusicIP server">
         <setting id="host" type="text" label="Host" default="localhost" />
         <setting id="port" type="number" label="Port" default="10002" />
+    </category>
+    <category label="Consistency check">
+        <setting id="consistency_enabled" type="bool" label="Enable saved-mix consistency service" default="true" />
+        <setting id="consistency_interval_minutes" type="number" label="Check interval (minutes)" default="60" />
+        <setting id="service_extended_logging" type="bool" label="Extended service logging" default="false" />
     </category>
 </settings>

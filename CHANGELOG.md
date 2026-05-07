@@ -1,5 +1,130 @@
 # CHANGELOG
 
+## Version 1.0.42
+
+- Fixed plugin-side extended logging crash caused by missing `get_setting_bool(...)` in `main.py`.
+- Moved **Extended plugin logging** to the general settings section.
+- **Extended service logging** remains in the consistency-check settings section.
+- Auto-repair diagnostics remain controlled by **Extended plugin logging**.
+- Consistency service info logs remain controlled by **Extended service logging**.
+
+## Version 1.0.41
+
+- Dropped the previous 1.0.41 build with a shared logging option.
+- Rebuilt from 1.0.40.
+- Added separate settings:
+  - **Extended plugin logging**
+  - **Extended service logging**
+- **Extended plugin logging** controls auto-repair diagnostics in the plugin.
+- **Extended service logging** controls normal info logging from the consistency service.
+- Auto-repair now logs missing paths, filename lookup, raw/unique candidate counts, candidates, automatic selections, manual selections, skipped tracks, replacements, and final repair count.
+- Error logging remains always enabled.
+
+## Version 1.0.40
+
+- Replaced the red dot marker with a plain red bold exclamation mark: `[B][COLOR red]![/COLOR][/B]`.
+- Missing songs in mix views now use the exclamation marker and populate `label2` with a missing-file warning.
+- Inconsistent date groups now populate `label2` with the warning count.
+- Added optional info-level logging for the consistency service.
+- New setting: **Enable consistency service info logging**.
+- Info logging shows service start/stop, check start/completion, number of mixes/tracks checked, inconsistent mixes found, and metadata updates.
+- Error logging remains always enabled.
+
+## Version 1.0.39
+
+- Added a Kodi service component for saved-mix consistency checks.
+- The service checks saved mixes in the background and writes `consistency` status to sidecar metadata.
+- Mix files are not modified by the background check.
+- Inconsistent mixes are marked with a red dot in the Recent Mixes views.
+- Date groups with inconsistent mixes are marked with a red dot and warning count.
+- Missing songs are marked with a red dot inside mix views.
+- Added **Check consistency** for saved mixes.
+- Added **Auto-repair this mix** for inconsistent saved mixes.
+- Auto-repair runs in the foreground and uses Kodi JSON-RPC lookup based on the old filename/path.
+- Ambiguous repair candidates are shown to the user for manual selection.
+
+## Version 1.0.38
+
+- Fixed repeated focus movement when the add-on view gains focus again.
+- Focus movement is now one-shot and requires a `focus_token`.
+- The token is generated only for refreshes triggered by **More like this** or **Less like this**.
+- The token is stored after it is applied, so the same refreshed URL cannot move focus repeatedly.
+- Existing `focus_index` values without a valid token no longer trigger cursor movement.
+- Relative `Action(Down)` navigation from 1.0.36 is preserved.
+
+## Version 1.0.37
+
+- Dropped the previous 1.0.37 seed-protection build.
+- Rebuilt from 1.0.36.
+- **Less like this** is no longer shown in the track context menu when the original mix seed at position 0 is selected.
+- **Less like this** remains available for all later tracks in the mix.
+- **More like this** remains available for the seed and all other tracks.
+
+## Version 1.0.36
+
+- Changed focus restoration after **More like this** and **Less like this** again.
+- Removed the absolute `SetFocus(50,<index>,absolute)` approach.
+- The refreshed mix view now waits briefly and then moves down with repeated `Action(Down)` calls until the intended row is reached.
+- After **More like this**, the target row remains the previously selected item.
+- After **Less like this**, the target row remains the item above the removed selection.
+- This assumes Kodi resets the refreshed list to the first item, which matches observed behavior.
+
+## Version 1.0.35
+
+- Fixed focus restoration after **More like this** and **Less like this** again.
+- The focus index was already passed correctly through the refreshed mix URL.
+- The focus operation now uses `SetFocus(50,<index>,absolute)` so Kodi interprets the index as an absolute item index instead of a visible-window-relative position.
+- This should keep the selection on the intended row after the mix view refreshes.
+
+## Version 1.0.34
+
+- Fixed focus restoration after **More like this** and **Less like this**.
+- Focus is no longer applied immediately after `Container.Update(...)`.
+- The intended focus index is now passed into the refreshed mix URL.
+- The refreshed mix view applies the pending focus after `endOfDirectory(...)`.
+- After **More like this**, focus should stay on the previously selected song.
+- After **Less like this**, focus should move to the song above the removed selection.
+- This release replaces the earlier experimental 1.0.34 consistency-check build, which is deferred for later.
+
+## Version 1.0.33
+
+- Removed local shuffling from **More like this** so insertion follows the intentional MusicIP submix order.
+- **Less like this** remains unshuffled.
+- After **More like this**, the view refreshes and tries to keep the selection on the previously selected song.
+- After **Less like this**, the view refreshes and tries to move the selection to the song above the one that was removed.
+- This keeps the presentation focused on the altered part of the mix.
+
+## Version 1.0.32
+
+- Removed local shuffling from **Less like this** so removal follows the intentional MusicIP submix order.
+- **More like this** still shuffles its generated submix before inserting tracks.
+- Altered mixes now keep their original saved-mix date group when changed by **More like this** or **Less like this**.
+- A separate `modified_ts` metadata value is written when a saved mix is changed in place.
+- Track count is still updated after in-place changes.
+
+## Version 1.0.31
+
+- Adjusted **Less like this** so the selected seed track identity is added to the removal match set before submix matches are added.
+- The selected seed track is still removed explicitly by its source-mix position.
+- This makes the intention clearer and keeps seed removal independent from whether the generated submix contains the seed.
+
+## Version 1.0.30
+
+- Changed **Less like this** to request a larger submix.
+- The submix request now uses double the configured mix size to increase the chance of finding matches in the source mix.
+- The selected track, which is the seed for the submix, is now removed from the source mix as well.
+- Duplicate/path matching still uses normalized track identity.
+- The source mix is saved immediately after removal.
+
+## Version 1.0.29
+
+- Added **Less like this** below **More like this** in track context menus inside MusicIP mix views.
+- The action generates a submix based on the selected track, shuffles the result locally, and removes matching tracks from the source mix.
+- Removing stops when 20% of the configured mix size has been reached.
+- The selected seed track itself is kept in the source mix.
+- The source mix is saved immediately after removal.
+- The action is guarded so it only works from within MusicIP add-on mix views.
+
 ## Version 1.0.28
 
 - Added **More like this** to track context menus inside MusicIP mix views.

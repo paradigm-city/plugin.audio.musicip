@@ -7,7 +7,6 @@ import glob
 import hashlib
 import json
 import os
-import random
 import sys
 import time
 import unicodedata
@@ -37,6 +36,15 @@ def log(message: str, level: int = xbmc.LOGINFO) -> None:
     xbmc.log(f"[{ADDON_ID}] {message}", level)
 
 
+def is_plugin_extended_logging_enabled() -> bool:
+    return get_setting_bool("plugin_extended_logging", False)
+
+
+def log_info(message: str) -> None:
+    if is_plugin_extended_logging_enabled():
+        log(message, xbmc.LOGINFO)
+
+
 def addon_url(**query: str) -> str:
     return f"{BASE_URL}?{urlencode(query)}"
 
@@ -51,6 +59,11 @@ def get_setting(name: str, default: str = "") -> str:
         return value if value != "" else default
     except Exception:
         return default
+
+
+def get_setting_bool(name: str, default: bool = False) -> bool:
+    raw = get_setting(name, "true" if default else "false").strip().lower()
+    return raw in ("true", "1", "yes", "on")
 
 
 def get_setting_int(name: str, default: int) -> int:
@@ -155,8 +168,13 @@ def save_mix_by_cache_path(cache_path: str, tracks: list[str]) -> None:
         handle.close()
 
     meta = get_saved_mix_metadata(cache_path, tracks)
+    original_updated_ts = int(meta.get("updated_ts") or 0)
     meta["track_count"] = len(tracks)
-    meta["updated_ts"] = int(time.time())
+    if original_updated_ts > 0:
+        meta["updated_ts"] = original_updated_ts
+    else:
+        meta["updated_ts"] = int(time.time())
+    meta["modified_ts"] = int(time.time())
     save_json_file(mix_meta_path_from_cache_path(cache_path), meta)
 
 
@@ -215,6 +233,85 @@ def get_saved_mix_metadata(cache_path: str, tracks: list[str] | None = None) -> 
     return merged
 
 
+def problem_marker_label(label: str) -> str:
+    return f"[B][COLOR red]![/COLOR][/B] {label}"
+
+
+def get_consistency_status(meta: dict) -> dict:
+    value = meta.get("consistency")
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+def is_mix_inconsistent(meta: dict) -> bool:
+    return str(get_consistency_status(meta).get("status") or "").lower() == "inconsistent"
+
+
+def get_consistency_label(meta: dict) -> str:
+    consistency = get_consistency_status(meta)
+    status = str(consistency.get("status") or "").strip().lower()
+
+    if status == "ok":
+        return "OK"
+
+    if status == "inconsistent":
+        missing = int(consistency.get("missing_files") or 0)
+        if missing == 1:
+            return "Inconsistent: 1 missing"
+        if missing > 1:
+            return f"Inconsistent: {missing} missing"
+        return "Inconsistent"
+
+    return ""
+
+
+def track_file_exists(path: str) -> bool:
+    value = str(path or "").strip()
+    if not value:
+        return False
+
+    try:
+        return bool(xbmcvfs.exists(value))
+    except Exception:
+        return False
+
+
+def set_mix_consistency_metadata(cache_path: str, tracks: list[str], consistency: dict) -> None:
+    meta = get_saved_mix_metadata(cache_path, tracks)
+    meta["track_count"] = len(tracks)
+    meta["consistency"] = consistency
+    save_json_file(mix_meta_path_from_cache_path(cache_path), meta)
+
+
+def analyze_mix_consistency(cache_path: str) -> dict:
+    tracks = load_mix_by_cache_path(cache_path)
+    missing: list[dict] = []
+
+    for index, track in enumerate(tracks):
+        if track_file_exists(track):
+            continue
+
+        missing.append({
+            "index": index,
+            "path": track,
+        })
+
+    consistency = {
+        "status": "ok" if not missing else "inconsistent",
+        "checked_ts": int(time.time()),
+        "checked_tracks": len(tracks),
+        "missing_files": len(missing),
+        "missing": missing,
+    }
+    set_mix_consistency_metadata(cache_path, tracks, consistency)
+    return consistency
+
+
+def is_track_missing(path: str) -> bool:
+    return not track_file_exists(path)
+
+
 def format_saved_mix_label(meta: dict) -> str:
     label = meta.get("label") or path_to_label(meta.get("seed", ""))
     track_count = int(meta.get("track_count") or 0)
@@ -271,6 +368,24 @@ def build_cleanup_saved_mix_action(cache_path: str) -> str:
         nonce=new_nonce(),
     )
     return f"RunPlugin({cleanup_url})"
+
+
+def build_check_mix_action(cache_path: str) -> str:
+    check_url = addon_url(
+        action="check_mix_consistency",
+        cache_path=cache_path,
+        nonce=new_nonce(),
+    )
+    return f"RunPlugin({check_url})"
+
+
+def build_repair_mix_action(cache_path: str) -> str:
+    repair_url = addon_url(
+        action="repair_mix",
+        cache_path=cache_path,
+        nonce=new_nonce(),
+    )
+    return f"RunPlugin({repair_url})"
 
 
 def delete_saved_mix_files(cache_path: str) -> None:
@@ -419,7 +534,20 @@ def new_nonce() -> str:
     return str(int(time.time() * 1000))
 
 
-def build_browse_url(seed: str, size: int, refresh: bool = False) -> str:
+def build_focus_token(focus_index: int = -1) -> str:
+    if focus_index < 0:
+        return ""
+
+    return new_nonce()
+
+
+def build_browse_url(
+    seed: str,
+    size: int,
+    refresh: bool = False,
+    focus_index: int = -1,
+    focus_token: str = "",
+) -> str:
     query = {
         "action": "browse_mix",
         "seed": seed,
@@ -428,10 +556,18 @@ def build_browse_url(seed: str, size: int, refresh: bool = False) -> str:
     }
     if refresh:
         query["refresh"] = "1"
+    if focus_index >= 0:
+        query["focus_index"] = str(focus_index)
+        query["focus_token"] = focus_token or build_focus_token(focus_index)
     return addon_url(**query)
 
 
-def build_saved_browse_url(cache_path: str, refresh: bool = False) -> str:
+def build_saved_browse_url(
+    cache_path: str,
+    refresh: bool = False,
+    focus_index: int = -1,
+    focus_token: str = "",
+) -> str:
     query = {
         "action": "browse_saved_mix",
         "cache_path": cache_path,
@@ -439,6 +575,9 @@ def build_saved_browse_url(cache_path: str, refresh: bool = False) -> str:
     }
     if refresh:
         query["refresh"] = "1"
+    if focus_index >= 0:
+        query["focus_index"] = str(focus_index)
+        query["focus_token"] = focus_token or build_focus_token(focus_index)
     return addon_url(**query)
 
 
@@ -476,6 +615,19 @@ def build_more_like_this_action(seed: str, size: int, index: int, path: str, cac
         nonce=new_nonce(),
     )
     return f"RunPlugin({more_url})"
+
+
+def build_less_like_this_action(seed: str, size: int, index: int, path: str, cache_path: str = "") -> str:
+    less_url = addon_url(
+        action="less_like_this",
+        seed=seed,
+        size=str(size),
+        index=str(index),
+        path=path,
+        cache_path=cache_path,
+        nonce=new_nonce(),
+    )
+    return f"RunPlugin({less_url})"
 
 
 def remove_track_from_mix(seed: str, size: int, index: int, path: str, cache_path: str = "") -> str:
@@ -518,6 +670,51 @@ def get_more_like_this_target_size() -> int:
     return max(1, round(get_playlist_size() * 0.20))
 
 
+def refresh_mix_container(url: str) -> None:
+    xbmc.executebuiltin(f"Container.Update({url},replace)")
+
+
+def focus_state_path() -> str:
+    return os.path.join(get_profile_dir(), "focus_state.json")
+
+
+def was_focus_token_already_applied(focus_token: str) -> bool:
+    if not focus_token:
+        return True
+
+    state = load_json_file(focus_state_path())
+    return str(state.get("last_focus_token") or "") == focus_token
+
+
+def mark_focus_token_applied(focus_token: str) -> None:
+    if not focus_token:
+        return
+
+    state = load_json_file(focus_state_path())
+    state["last_focus_token"] = focus_token
+    state["last_focus_ts"] = int(time.time())
+    save_json_file(focus_state_path(), state)
+
+
+def apply_pending_focus(focus_index: int = -1, focus_token: str = "") -> None:
+    if focus_index < 0:
+        return
+
+    if was_focus_token_already_applied(focus_token):
+        return
+
+    mark_focus_token_applied(focus_token)
+
+    try:
+        xbmc.sleep(250)
+
+        for _ in range(max(0, focus_index)):
+            xbmc.executebuiltin("Action(Down)")
+            xbmc.sleep(25)
+    except Exception:
+        pass
+
+
 def find_track_position(tracks: list[str], index: int, path: str) -> int:
     if 0 <= index < len(tracks):
         if not path or tracks[index] == path:
@@ -550,8 +747,6 @@ def insert_more_like_this_into_mix(seed: str, size: int, index: int, path: str, 
 
     target_count = get_more_like_this_target_size()
     submix_tracks = fetch_mix(path, get_playlist_size())
-    random.shuffle(submix_tracks)
-
     existing = {
         normalize_track_identity(track)
         for track in source_tracks
@@ -578,6 +773,60 @@ def insert_more_like_this_into_mix(seed: str, size: int, index: int, path: str, 
     updated_tracks = source_tracks[:insert_at] + new_tracks + source_tracks[insert_at:]
     save_mix_by_cache_path(target_cache_path, updated_tracks)
     return len(new_tracks)
+
+
+
+def remove_less_like_this_from_mix(seed: str, size: int, index: int, path: str, cache_path: str = "") -> int:
+    if not path:
+        raise MusicIPError("No seed track was supplied for Less like this.")
+
+    target_cache_path = cache_path or mix_cache_path(seed, size)
+    source_tracks = load_mix_by_cache_path(target_cache_path)
+    if not source_tracks:
+        raise MusicIPError("Stored mix is empty.")
+
+    selected_position = find_track_position(source_tracks, index, path)
+    if selected_position < 0:
+        raise MusicIPError("Could not locate the selected track in the source mix.")
+
+    target_count = get_more_like_this_target_size()
+    submix_request_size = max(1, get_playlist_size() * 2)
+    submix_tracks = fetch_mix(path, submix_request_size)
+    selected_seed_identity = normalize_track_identity(path)
+
+    removable_matches: set[str] = set()
+    if selected_seed_identity:
+        removable_matches.add(selected_seed_identity)
+
+    for track in submix_tracks:
+        normalized = normalize_track_identity((track or "").strip())
+        if normalized:
+            removable_matches.add(normalized)
+
+    if not removable_matches:
+        raise MusicIPError("No matching tracks found for this song.")
+
+    removed = 0
+    updated_tracks: list[str] = []
+
+    for pos, track in enumerate(source_tracks):
+        normalized = normalize_track_identity(track)
+
+        if pos == selected_position:
+            removed += 1
+            continue
+
+        if normalized in removable_matches and removed < target_count:
+            removed += 1
+            continue
+
+        updated_tracks.append(track)
+
+    if removed <= 0:
+        raise MusicIPError("No matching tracks from the source mix could be removed.")
+
+    save_mix_by_cache_path(target_cache_path, updated_tracks)
+    return removed
 
 
 def is_addon_mix_container_active() -> bool:
@@ -804,6 +1053,154 @@ def log_library_candidates(path: str, songs: list[dict]) -> None:
         file_value = str(song.get("file") or "")
         log(f"Kodi candidate file: {file_value!r}", xbmc.LOGDEBUG)
         log(f"Kodi candidate canonical: {canonical_audio_path(file_value)!r}", xbmc.LOGDEBUG)
+
+
+def get_unique_song_candidates(songs: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    result: list[dict] = []
+
+    for song in songs:
+        file_value = str(song.get("file") or "").strip()
+        key = canonical_audio_path(file_value)
+        if not file_value or not key or key in seen:
+            continue
+
+        seen.add(key)
+        result.append(song)
+
+    return result
+
+
+def get_repair_candidates_for_path(old_path: str) -> list[dict]:
+    filename, _directory = split_full_path(old_path)
+    if not filename:
+        log_info(f"Auto-repair: no filename could be extracted from old path: {old_path!r}")
+        return []
+
+    log_info(f"Auto-repair: searching Kodi library by filename: {filename!r}")
+    candidates = query_library_songs_by_filename(filename)
+    unique_candidates = get_unique_song_candidates(candidates)
+    log_info(
+        f"Auto-repair: Kodi returned {len(candidates)} raw candidate(s), "
+        f"{len(unique_candidates)} unique candidate(s) for {filename!r}."
+    )
+    return unique_candidates
+
+
+def format_repair_candidate_label(song: dict) -> str:
+    title = str(song.get("title") or "").strip()
+    artist = first_non_empty_text(song.get("artist"))
+    album = str(song.get("album") or "").strip()
+    file_value = str(song.get("file") or "").strip()
+
+    parts: list[str] = []
+    if artist:
+        parts.append(artist)
+    if title:
+        parts.append(title)
+    if album:
+        parts.append(f"[{album}]")
+
+    if parts:
+        return " - ".join(parts) + f" · {file_value}"
+
+    return file_value or "Unknown candidate"
+
+
+def log_repair_candidates(old_path: str, candidates: list[dict]) -> None:
+    log_info(f"Auto-repair: missing path: {old_path!r}")
+    log_info(f"Auto-repair: candidate count: {len(candidates)}")
+    for index, candidate in enumerate(candidates, start=1):
+        log_info(
+            "Auto-repair candidate "
+            f"{index}: file={str(candidate.get('file') or '').strip()!r}, "
+            f"title={str(candidate.get('title') or '').strip()!r}, "
+            f"artist={first_non_empty_text(candidate.get('artist'))!r}, "
+            f"album={str(candidate.get('album') or '').strip()!r}"
+        )
+
+
+def choose_repair_candidate(old_path: str, candidates: list[dict]) -> str:
+    log_repair_candidates(old_path, candidates)
+
+    if not candidates:
+        log_info("Auto-repair: no repair candidates found.")
+        return ""
+
+    matched = find_song_by_file_relaxed(candidates, old_path)
+    if matched is not None:
+        value = str(matched.get("file") or "").strip()
+        if value:
+            log_info(f"Auto-repair: relaxed lookup selected candidate automatically: {value!r}")
+            return value
+
+    if len(candidates) == 1:
+        value = str(candidates[0].get("file") or "").strip()
+        log_info(f"Auto-repair: single candidate selected automatically: {value!r}")
+        return value
+
+    log_info("Auto-repair: ambiguous candidates found, showing manual selection dialog.")
+    labels = ["Skip this track"] + [format_repair_candidate_label(song) for song in candidates]
+    selected = xbmcgui.Dialog().select(
+        f"Repair missing track: {path_to_label(old_path)}",
+        labels,
+    )
+
+    if selected < 0:
+        log_info("Auto-repair: manual selection cancelled.")
+        raise MusicIPError("Repair cancelled.")
+
+    if selected == 0:
+        log_info("Auto-repair: user skipped this track.")
+        return ""
+
+    value = str(candidates[selected - 1].get("file") or "").strip()
+    log_info(f"Auto-repair: user selected repair candidate: {value!r}")
+    return value
+
+
+def repair_saved_mix_foreground(cache_path: str) -> int:
+    log_info(f"Auto-repair: started for saved mix: {cache_path!r}")
+
+    tracks = load_mix_by_cache_path(cache_path)
+    if not tracks:
+        log_info("Auto-repair: stored mix is empty.")
+        raise MusicIPError("Stored mix is empty.")
+
+    repaired = 0
+    missing = 0
+    updated_tracks: list[str] = []
+
+    for index, track in enumerate(tracks):
+        if track_file_exists(track):
+            updated_tracks.append(track)
+            continue
+
+        missing += 1
+        log_info(f"Auto-repair: track {index} is missing: {track!r}")
+
+        candidates = get_repair_candidates_for_path(track)
+        replacement = choose_repair_candidate(track, candidates)
+
+        if replacement:
+            log_info(f"Auto-repair: replacing {track!r} with {replacement!r}")
+            updated_tracks.append(replacement)
+            repaired += 1
+        else:
+            log_info(f"Auto-repair: no replacement selected for {track!r}")
+            updated_tracks.append(track)
+
+    log_info(f"Auto-repair: completed candidate handling. Missing={missing}, repaired={repaired}.")
+
+    if repaired <= 0:
+        analyze_mix_consistency(cache_path)
+        log_info("Auto-repair: no tracks were repaired.")
+        raise MusicIPError("No tracks were repaired.")
+
+    save_mix_by_cache_path(cache_path, updated_tracks)
+    analyze_mix_consistency(cache_path)
+    log_info(f"Auto-repair: saved repaired mix. Repaired={repaired}.")
+    return repaired
 
 
 def query_library_songs_by_filename(filename: str) -> list[dict]:
@@ -1132,11 +1529,15 @@ def apply_track_detail_display(
 def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str = '') -> None:
     metadata = get_track_metadata(path)
     label = metadata['title'] or path_to_label(path)
-    list_item = xbmcgui.ListItem(label=label, offscreen=True)
+    missing = is_track_missing(path)
+    display_label = problem_marker_label(label) if missing else label
+    list_item = xbmcgui.ListItem(label=display_label, offscreen=True)
     list_item.setProperty("IsPlayable", "true")
+    if missing:
+        list_item.setProperty("MusicIP.Missing", "true")
     apply_music_metadata(
         list_item,
-        label,
+        display_label,
         artist=metadata.get('artist', ''),
         album=metadata.get('album', ''),
         year=parse_year(metadata.get('year')),
@@ -1155,6 +1556,11 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
         genres=metadata.get('genre'),
         duration=parse_duration_seconds(metadata.get('duration')),
     )
+    if missing:
+        try:
+            list_item.setLabel2("[B][COLOR red]![/COLOR][/B] Missing file")
+        except Exception:
+            pass
     apply_music_path(list_item, path)
     apply_music_artwork(
         list_item,
@@ -1165,11 +1571,18 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
     refresh_action = build_refresh_action(seed, size, cache_path=cache_path)
     more_like_this_action = build_more_like_this_action(seed, size, index, path, cache_path=cache_path)
     remove_action = build_remove_action(seed, size, index, path, cache_path=cache_path)
-    list_item.addContextMenuItems([
+
+    context_items = [
         ("Refresh mix", refresh_action),
         ("More like this", more_like_this_action),
-        ("Remove from mix", remove_action),
-    ])
+    ]
+
+    if index > 0:
+        less_like_this_action = build_less_like_this_action(seed, size, index, path, cache_path=cache_path)
+        context_items.append(("Less like this", less_like_this_action))
+
+    context_items.append(("Remove from mix", remove_action))
+    list_item.addContextMenuItems(context_items)
 
     url = addon_url(
         action="play_track",
@@ -1181,8 +1594,29 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
 
 def add_saved_mix_date_item(date_key: str, cache_paths: list[str]) -> None:
     count = len(cache_paths)
+    inconsistent = 0
+
+    for cache_path in cache_paths:
+        try:
+            tracks = load_mix_by_cache_path(cache_path)
+            meta = get_saved_mix_metadata(cache_path, tracks)
+            if is_mix_inconsistent(meta):
+                inconsistent += 1
+        except Exception:
+            pass
+
     label = f"{date_key} ({count} mix{'es' if count != 1 else ''})"
+    warning_label = ""
+    if inconsistent:
+        warning_label = f"{inconsistent} warning{'s' if inconsistent != 1 else ''}"
+        label = problem_marker_label(f"{label} · {warning_label}")
+
     list_item = xbmcgui.ListItem(label=label, offscreen=True)
+    if warning_label:
+        try:
+            list_item.setLabel2(warning_label)
+        except Exception:
+            pass
     apply_music_metadata(list_item, label)
     list_item.setProperty("IsPlayable", "false")
     list_item.addContextMenuItems([
@@ -1201,16 +1635,32 @@ def add_saved_mix_item(cache_path: str) -> None:
     tracks = load_mix_by_cache_path(cache_path)
     meta = get_saved_mix_metadata(cache_path, tracks)
     label = format_saved_mix_label(meta)
-    list_item = xbmcgui.ListItem(label=label, offscreen=True)
-    apply_music_metadata(list_item, label)
+    consistency_label = get_consistency_label(meta)
+    inconsistent = is_mix_inconsistent(meta)
+
+    display_label = problem_marker_label(label) if inconsistent else label
+    list_item = xbmcgui.ListItem(label=display_label, offscreen=True)
+    apply_music_metadata(list_item, display_label)
     list_item.setProperty("IsPlayable", "false")
-    list_item.addContextMenuItems([
-        ("Cleanup this mix", build_cleanup_saved_mix_action(cache_path)),
-    ])
+    if inconsistent:
+        list_item.setProperty("MusicIP.Inconsistent", "true")
+
+    context_items = [
+        ("Check consistency", build_check_mix_action(cache_path)),
+    ]
+    if inconsistent:
+        context_items.append(("Auto-repair this mix", build_repair_mix_action(cache_path)))
+    context_items.append(("Cleanup this mix", build_cleanup_saved_mix_action(cache_path)))
+    list_item.addContextMenuItems(context_items)
 
     updated_ts = int(meta.get("updated_ts") or 0)
+    detail_parts: list[str] = []
     if updated_ts > 0:
-        list_item.setLabel2(time.strftime("%Y-%m-%d %H:%M", time.localtime(updated_ts)))
+        detail_parts.append(time.strftime("%Y-%m-%d %H:%M", time.localtime(updated_ts)))
+    if consistency_label and consistency_label != "OK":
+        detail_parts.append(consistency_label)
+    if detail_parts:
+        list_item.setLabel2(" · ".join(detail_parts))
 
     xbmcplugin.addDirectoryItem(
         HANDLE,
@@ -1311,7 +1761,14 @@ def generate_current_mix() -> None:
     browse_mix(seed, size, force_refresh=False, update_listing=False)
 
 
-def browse_mix(seed: str, size: int, force_refresh: bool = False, update_listing: bool = False) -> None:
+def browse_mix(
+    seed: str,
+    size: int,
+    force_refresh: bool = False,
+    update_listing: bool = False,
+    focus_index: int = -1,
+    focus_token: str = "",
+) -> None:
     xbmcplugin.setPluginCategory(HANDLE, f"MusicIP mix: {path_to_label(seed)}")
     xbmcplugin.setContent(HANDLE, "songs")
     xbmcplugin.addSortMethod(HANDLE, xbmcplugin.SORT_METHOD_UNSORTED)
@@ -1344,9 +1801,16 @@ def browse_mix(seed: str, size: int, force_refresh: bool = False, update_listing
             add_track_item(seed, size, index, path, cache_path=cache_path)
 
     xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing, cacheToDisc=False)
+    apply_pending_focus(focus_index, focus_token)
 
 
-def browse_saved_mix(cache_path: str, force_refresh: bool = False, update_listing: bool = False) -> None:
+def browse_saved_mix(
+    cache_path: str,
+    force_refresh: bool = False,
+    update_listing: bool = False,
+    focus_index: int = -1,
+    focus_token: str = "",
+) -> None:
     try:
         tracks = load_mix_by_cache_path(cache_path)
         meta = get_saved_mix_metadata(cache_path, tracks)
@@ -1387,6 +1851,7 @@ def browse_saved_mix(cache_path: str, force_refresh: bool = False, update_listin
             add_track_item(seed, size, index, path, cache_path=cache_path)
 
     xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing, cacheToDisc=False)
+    apply_pending_focus(focus_index, focus_token)
 
 
 def play_track(path: str) -> None:
@@ -1483,6 +1948,41 @@ def router() -> None:
         xbmc.executebuiltin(f"Container.Update({build_saved_mixes_url()},replace)")
         return
 
+    if action == "check_mix_consistency":
+        cache_path = params.get("cache_path", "").strip()
+        if not cache_path:
+            notify("No saved mix was selected.", xbmcgui.NOTIFICATION_ERROR)
+            return
+
+        consistency = analyze_mix_consistency(cache_path)
+        missing = int(consistency.get("missing_files") or 0)
+
+        if missing:
+            notify(f"Mix inconsistent: {missing} missing.", xbmcgui.NOTIFICATION_WARNING)
+        else:
+            notify("Mix consistency OK.")
+
+        xbmc.executebuiltin("Container.Refresh")
+        return
+
+    if action == "repair_mix":
+        cache_path = params.get("cache_path", "").strip()
+        if not cache_path:
+            notify("No saved mix was selected.", xbmcgui.NOTIFICATION_ERROR)
+            return
+
+        try:
+            repaired = repair_saved_mix_foreground(cache_path)
+        except MusicIPError as exc:
+            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            log(str(exc), xbmc.LOGERROR)
+            xbmc.executebuiltin("Container.Refresh")
+            return
+
+        notify(f"Repaired {repaired} track(s).")
+        xbmc.executebuiltin("Container.Refresh")
+        return
+
     if action == "generate_current_mix":
         generate_current_mix()
         return
@@ -1495,7 +1995,19 @@ def router() -> None:
             return
         size = int(params.get("size") or get_playlist_size())
         refresh = params.get("refresh") == "1"
-        browse_mix(seed, size, force_refresh=refresh, update_listing=refresh)
+        try:
+            focus_index = int(params.get("focus_index", "-1"))
+        except (TypeError, ValueError):
+            focus_index = -1
+        focus_token = params.get("focus_token", "").strip()
+        browse_mix(
+            seed,
+            size,
+            force_refresh=refresh,
+            update_listing=refresh,
+            focus_index=focus_index,
+            focus_token=focus_token,
+        )
         return
 
     if action == "browse_saved_mix":
@@ -1505,7 +2017,18 @@ def router() -> None:
             xbmcplugin.endOfDirectory(HANDLE, succeeded=False, cacheToDisc=False)
             return
         refresh = params.get("refresh") == "1"
-        browse_saved_mix(cache_path, force_refresh=refresh, update_listing=refresh)
+        try:
+            focus_index = int(params.get("focus_index", "-1"))
+        except (TypeError, ValueError):
+            focus_index = -1
+        focus_token = params.get("focus_token", "").strip()
+        browse_saved_mix(
+            cache_path,
+            force_refresh=refresh,
+            update_listing=refresh,
+            focus_index=focus_index,
+            focus_token=focus_token,
+        )
         return
 
     if action == "play_track":
@@ -1561,10 +2084,36 @@ def router() -> None:
 
         notify(f"Inserted {inserted} track(s).")
         if cache_path:
-            xbmc.executebuiltin(f"Container.Update({build_saved_browse_url(cache_path)},replace)")
+            refresh_mix_container(build_saved_browse_url(cache_path, focus_index=index))
         else:
-            xbmc.executebuiltin(f"Container.Update({build_browse_url(seed, size)},replace)")
+            refresh_mix_container(build_browse_url(seed, size, focus_index=index))
         return
+    if action == "less_like_this":
+        seed = params.get("seed", "").strip()
+        size = int(params.get("size") or get_playlist_size())
+        try:
+            index = int(params.get("index", "-1"))
+        except (TypeError, ValueError):
+            index = -1
+        path = params.get("path", "")
+        cache_path = params.get("cache_path", "").strip()
+
+        try:
+            ensure_remove_allowed_from_addon_container()
+            removed = remove_less_like_this_from_mix(seed, size, index, path, cache_path=cache_path)
+        except MusicIPError as exc:
+            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            log(str(exc), xbmc.LOGERROR)
+            return
+
+        notify(f"Removed {removed} track(s).")
+        focus_index = max(0, index - 1)
+        if cache_path:
+            refresh_mix_container(build_saved_browse_url(cache_path, focus_index=focus_index))
+        else:
+            refresh_mix_container(build_browse_url(seed, size, focus_index=focus_index))
+        return
+
 
     if action == "open_settings":
         open_settings()
