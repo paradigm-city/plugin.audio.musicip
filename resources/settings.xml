@@ -2,16 +2,30 @@
 <settings>
     <category label="General">
                 <setting id="plugin_extended_logging" type="bool" label="Extended plugin logging" default="false" />
-<setting id="playlist_size" type="number" label="Playlist size (tracks)" default="20" />
-        <setting id="timeout" type="number" label="HTTP timeout (seconds)" default="10" />
+<setting id="timeout" type="number" label="HTTP timeout (seconds)" default="10" />
     </category>
     <category label="MusicIP server">
         <setting id="host" type="text" label="Host" default="localhost" />
         <setting id="port" type="number" label="Port" default="10002" />
     </category>
+    <category label="Mix parameters">
+        <setting id="playlist_size" type="slider" label="Mix size (tracks)" default="20" range="1,1,100" option="int" />
+        <setting id="mix_style_preference" type="slider" label="Style preference (0 ignore, 10 strongly prefer)" default="2" range="0,1,10" option="int" />
+        <setting id="mix_variety" type="slider" label="Variety" default="0" range="0,1,9" option="int" />
+        <setting id="mix_genre" type="bool" label="Restrict to seed genre" default="false" />
+        <setting id="mix_filter" type="text" label="MusicIP filter" default="" />
+        <setting id="mix_reject_size" type="slider" label="Do not repeat artist within this many tracks" default="0" range="0,1,20" option="int" />
+    </category>
+
+    <category label="Discovery mode">
+        <setting id="discovery_excerpt_seconds" type="slider" label="Excerpt length (seconds)" default="20" range="5,1,60" option="int" />
+        <setting id="discovery_offset_percent" type="slider" label="Start offset into song (%)" default="33" range="0,1,90" option="int" />
+    </category>
+
     <category label="Consistency check">
         <setting id="consistency_enabled" type="bool" label="Enable saved-mix consistency service" default="true" />
         <setting id="consistency_interval_minutes" type="number" label="Check interval (minutes)" default="60" />
         <setting id="service_extended_logging" type="bool" label="Extended service logging" default="false" />
+        <setting id="service_auto_repair_enabled" type="bool" label="Enable automatic mix repair" default="false" />
     </category>
 </settings>

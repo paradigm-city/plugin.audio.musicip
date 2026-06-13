@@ -1,5 +1,546 @@
 # CHANGELOG
 
+## Version 1.0.92
+
+- Fixed generated mix view still showing only the plain track title.
+- Kodi music views may display `MusicInfoTag.title` instead of the raw `ListItem` label.
+- Generated mix rows now set the formatted mix label as `MusicInfoTag.title`.
+- Generated mix playback playlist items do the same.
+- The original track title is preserved as `MusicIP.OriginalTitle` on the list item.
+- `%N` still reflects the generated mix position.
+- Discovery mode labels and playlist behavior remain unchanged.
+
+## Version 1.0.91
+
+- Generated mix track rows now use Kodi's configured music track naming template where available.
+- Generated mix playback playlist items use the same formatting.
+- For templates such as `[%N. ]%A - %T`, `%N` now reflects the position inside the generated mix.
+- MusicInfoTag track number is also set to the mix position for generated mix items.
+- Discovery mode labels and Discovery playlist behavior are intentionally unchanged.
+- Generate mix autoplay from 1.0.90 is preserved.
+- API parameter casing fix from 1.0.89 is preserved.
+
+## Version 1.0.90
+
+- `Generate mix from playing audio` now starts playback after successful mix generation.
+- The route now uses the same proven primitives as the working Discovery mix path:
+  - `fetch_mix_confirmed(seed, size)`
+  - `save_mix(seed, size, tracks)`
+  - `play_tracks_as_music_playlist(tracks)`
+  - `Container.Update(build_browse_url(seed, size), replace)`
+- Handled MusicIP/API errors are still shown as visible plugin items instead of causing a failed Kodi directory listing.
+- The working `Generate mix from current discovery song` route is intentionally unchanged.
+- API parameter casing fix from 1.0.89 is preserved.
+
+## Version 1.0.89
+
+- Fixed outgoing MusicIP API parameter casing.
+- Mix requests now send:
+  - `sizeType=tracks`
+  - `rejectType=tracks`
+- Internal config/sidecar keys remain lowercase, but the HTTP request maps them to the canonical API names.
+- This addresses repeated MusicIP HTTP 500 responses where the request URL used `sizetype=tracks` and `rejecttype=tracks`.
+- MusicIP HTTP errors are now represented by a visible error item in the plugin directory instead of returning `xbmcplugin.endOfDirectory(..., succeeded=False)`.
+- This should prevent Kodi `GetDirectory(...generate_current_mix) failed` messages for handled MusicIP server errors.
+- Documentation baseline from 1.0.88 is preserved.
+
+## Version 1.0.88
+
+- Documentation-only build based on 1.0.87.
+- Updated README documentation section.
+- Added `docs/` folder with current concept documentation:
+  - concept overview
+  - Discovery mode concept
+  - repair strategy concept
+  - sidecar metadata concept
+  - testing and quality notes
+- Added Mermaid flow diagrams and PNG exports:
+  - Discovery mode flow
+  - Discovery service state flow
+  - playlist buffer flow
+  - repair readiness flow
+  - mix generation flow
+- Clarified that the discarded 1.0.86 crossfade experiment is not part of the current baseline.
+- No functional code change beyond the package version/documentation update.
+
+## Version 1.0.87
+
+- Added external playback takeover detection for Discovery mode.
+- While Discovery mode is active, the service now checks whether the currently playing file still belongs to the Discovery queue.
+- If Kodi starts playing something outside the Discovery queue, Discovery mode is stopped with `stop_reason="external_playback"`.
+- External playback is left untouched:
+  - no `Player.stop()`
+  - no playlist clear
+  - no forced navigation
+- Discovery state is cleared and the Discovery screen is refreshed if visible.
+- Base is 1.0.85; the discarded 1.0.86 crossfade feature is not included.
+
+## Version 1.0.85
+
+- Adjusted Discovery mix-dialog cancel timing.
+- If the mix dialog was open shorter than the configured excerpt length, Discovery now continues the existing excerpt timer instead of resetting it to now.
+- If the mix dialog was open at least as long as the excerpt length, Discovery still skips directly to the next song.
+- This makes the timer behave as if the dialog had not been opened.
+- Mix dialog hold from 1.0.84 is preserved.
+
+## Version 1.0.84
+
+- Added a Discovery **mix dialog hold** while creating a mix from the current Discovery song.
+- The seed song is captured immediately when the action is selected.
+- While the mix parameter dialog is open:
+  - Discovery playback continues.
+  - Excerpt-based auto-skip is paused.
+  - The captured seed remains stable.
+- On cancel/error:
+  - if the dialog was open at least as long as the excerpt length, Discovery skips directly to the next song.
+  - otherwise Discovery resumes from the current song with the excerpt timer reset to now.
+- On confirmation, the mix is generated from the captured seed and Discovery mode stops as before.
+- Double-next fix from 1.0.83 and mix-generation fix from 1.0.82 are preserved.
+
+## Version 1.0.83
+
+- Fixed double-skip after **Skip to next discovery song**.
+- In buffered playlist mode, `player_stop` callbacks while playback continues are now treated as normal playlist transitions.
+- The service no longer converts such pending stop events into a second `next_requested`.
+- Real Stop still disables Discovery mode when playback is no longer active.
+- Seek correction remains in place when Kodi restarts a playlist item near the beginning instead of respecting the Discovery offset.
+- Mix generation fix from 1.0.82 is preserved.
+- Manual next timer fix from 1.0.80 is preserved.
+
+## Version 1.0.82
+
+- Fixed **Generate mix from current discovery song** failing with `name get_mix_size not defined`.
+- Reworked `discovery_mix_from_current()` to use existing add-on functions:
+  - `get_playlist_size()`
+  - `fetch_mix_confirmed(seed, size)`
+  - `save_mix(seed, size, tracks)`
+  - `play_tracks_as_music_playlist(tracks)`
+  - `build_browse_url(seed, size)`
+- Removed calls to non-existing helpers:
+  - `get_mix_size()`
+  - `get_mix_generation_params_from_dialog()`
+  - `create_mix()`
+  - `play_saved_mix()`
+- The generated mix is saved, played immediately, and the container is replaced with the generated mix view.
+- Discovery screen restore and playlist maintenance from previous builds are preserved.
+
+## Version 1.0.81
+
+- Fixed empty screen after **Generate mix from current discovery song**.
+- `discovery_mix_from_current()` now avoids returning an empty plugin directory.
+- On success it replaces the current container with the generated mix view.
+- On cancellation, missing seed or errors it returns to the Discovery mode screen.
+- Manual next timer fix from 1.0.80 is preserved.
+- Discovery side-effect screen restore from 1.0.79 is preserved.
+- Smooth playlist maintenance from 1.0.78 is preserved.
+
+## Version 1.0.80
+
+- Fixed manual **Skip to next discovery song** causing the next song to play only briefly.
+- After direct `Player.GoTo(next_position)`, the UI now immediately updates Discovery state:
+  - current playlist position
+  - current song
+  - current label
+  - current offset/duration
+  - `current_started_ts`
+- Added `update_discovery_state_for_playlist_position()` in `main.py`.
+- Added a short service-side guard after UI-triggered next jumps so the old excerpt timer cannot immediately advance again.
+- Discovery screen restore behavior from 1.0.79 is preserved.
+- Smooth playlist maintenance from 1.0.78 is preserved.
+
+## Version 1.0.79
+
+- Fixed empty screen after Discovery side-effect actions.
+- `Start discovery mode`, `Skip to next discovery song` and `Stop discovery mode` now explicitly replace the current container with the Discovery mode screen.
+- Added `replace_with_discovery_mode_menu()` using `Container.Update(...action=discovery_mode..., replace)`.
+- Removed `finish_plugin_action()` from those three routes to avoid returning an empty directory view.
+- Discovery playlist buffering and smooth playback behavior from 1.0.78 are preserved.
+
+## Version 1.0.78
+
+- Fixed Discovery playlist being replaced after direct UI start.
+- The UI no longer writes delayed Discovery `start`, `stop` or `next` command files for actions it already performs directly.
+- Added `startup_in_progress` guard so the service does not write into the playlist while the UI is still loading the library and building the initial queue.
+- Fixed playlist position handling where position `0` could be treated like an unset value.
+- Fixed immediate/irregular excerpt switching when `current_started_ts` is not initialized.
+- Refill now appends new songs only at the end of the Kodi music playlist.
+- Added backlog pruning: old items are removed from the top only after more than 10 previous items exist.
+- Discovery playlist now aims to keep 10 future items and 10 previous items where possible.
+- Stop still clears the playlist and disables Discovery mode.
+- Startup reset and JSON-RPC fixes from 1.0.77 are preserved.
+
+## Version 1.0.77
+
+- Discovery mode is now explicitly reset to off at addon/service startup.
+- `discovery_mode_state.json` is normalized on service startup:
+  - `enabled=false`
+  - current song/label cleared
+  - current playlist position reset
+  - queue cleared
+  - pending next/stop flags cleared
+  - `stop_reason=startup_reset`
+- Stale `discovery_mode_command.json` is removed on service startup.
+- Kodi music playlist is cleared during the Discovery startup reset.
+- Re-applied the 1.0.76 JSON-RPC fix: removed invalid `songid` from `AudioLibrary.GetSongs` properties.
+- Re-applied the service JSON helper fix for `load_json_file()` / `save_json_file()`.
+- Added a safe fallback `run_consistency_check()` if this Discovery branch does not contain the full consistency-service implementation.
+
+## Version 1.0.75
+
+- Discovery mode no longer depends on the background service merely to start playback.
+- `start_discovery_mode()` now builds and starts the buffered Kodi music playlist directly from `main.py`.
+- The service still receives the start command and can maintain/refill the buffer when it is running.
+- The service now adopts an already direct-started Discovery queue instead of immediately rebuilding it.
+- `stop_discovery_mode()` now directly stops the player, clears the music playlist and finishes the plugin route.
+- `discovery_next_track()` now sends a direct `Player.GoTo` request as a fallback while still writing the service command.
+- Added `finish_plugin_action()` so side-effect routes call `xbmcplugin.endOfDirectory(...)`.
+- This should remove `GetDirectory(...discovery_start/stop...) failed` errors for those routes.
+- Kept unconditional Discovery logging from 1.0.74.
+
+## Version 1.0.74
+
+- Added unconditional INFO logging for the Discovery playlist-buffer start path.
+- Service startup now logs version, profile path, Discovery state path and Discovery command path.
+- Discovery command loading now logs command-file presence, payload and delete result.
+- Discovery start now logs command processing, library lookup, queue filling, playlist append operations and Player.play.
+- `AudioLibrary.GetSongs` now requests `songid` and has a fallback without random sort.
+- Playlist buffer filling now has an attempt limit and logs if no items can be appended.
+- Discovery start now clears stale `stopped_ts` values before command processing.
+- UI start command now also clears stale queue/current-song fields and logs the state/command paths.
+- Intended to diagnose and fix the case where Discovery mode is enabled but the playlist remains empty.
+
+## Version 1.0.73
+
+- Reworked Discovery mode to use a buffered Kodi music playlist.
+- Discovery mode now owns the Kodi music playlist while active.
+- Start Discovery mode now clears the music playlist and fills it with a buffer of 10 random tracks.
+- The service keeps the playlist buffer topped up in the background.
+- Native Kodi Next can now move immediately to the next buffered Discovery item.
+- Manual **Next discovery song** uses `Player.GoTo` instead of replacing the whole song manually.
+- Automatic excerpt switching also advances the buffered playlist.
+- The current Discovery song is tracked from the Kodi playlist position.
+- Offset/StartOffset metadata is stored per buffered playlist item.
+- This reduces reliance on delayed callback interpretation for Next behavior.
+
+## Version 1.0.72
+
+- Fixed Discovery mode treating Kodi's player-stop callback too aggressively.
+- `onPlayBackStopped()` now sets a pending stop instead of immediately disabling Discovery mode.
+- The service classifies the pending stop after a short delay:
+  - playback really stopped => stop Discovery mode
+  - playback continues near the beginning => treat as Previous/cursor-down and seek back to the Discovery offset
+  - playback continues elsewhere => treat as Next/cursor-up and start the next Discovery song
+- This addresses Next/cursor-up on a one-item playlist, where Kodi can emit a stop-like event without actually stopping playback.
+- Stop still stops Discovery mode.
+- Settings accessibility and Discovery StartOffset behavior from previous builds are preserved.
+
+## Version 1.0.71
+
+- Added Discovery-mode handling for player Next / cursor-up behavior.
+- `onPlayBackEnded()` now requests the next discovery song while Discovery mode is active.
+- Added `next_requested` state handling in the service loop.
+- Added seek-position correction while Discovery mode is active.
+- If Previous / cursor-down restarts the current song near the beginning, the service seeks back to the configured Discovery offset.
+- Stop still stops Discovery mode through the existing player-stop handling.
+- Settings accessibility fix from 1.0.70 is preserved.
+
+## Version 1.0.70
+
+- Fixed Settings becoming inaccessible.
+- Removed `RunPlugin(...)` as a ListItem URL for Settings entries.
+- Root **Settings** now uses a normal plugin URL again.
+- **Discovery mode settings** now uses a normal plugin URL again.
+- `open_settings()` opens the settings dialog and then replaces the current container with the canonical root menu.
+- This avoids Kodi treating `RunPlugin(plugin://...)` as a playable media file while still reducing the chance that Settings remains in the Back navigation path.
+- Discovery playback, StartOffset handling and UI refresh behavior from 1.0.68/1.0.69 are preserved.
+
+## Version 1.0.69
+
+- Settings are now opened through `RunPlugin(...)` actions instead of normal plugin-folder navigation.
+- The root **Settings** item is now a non-folder action item.
+- **Discovery mode settings** is now a non-folder action item.
+- `open_settings()` now opens the settings dialog and returns without rendering the root directory.
+- This keeps settings out of the normal Back navigation stack as far as Kodi plugin directories allow.
+- Discovery playback, StartOffset handling and UI refresh behavior from 1.0.68 are preserved.
+
+## Version 1.0.68
+
+- Reduced audible Discovery-mode start/seek jump.
+- Discovery mode now tries to resolve duration before playback using Kodi library song details.
+- Discovery playback now uses a playlist item with `StartOffset` before playback starts.
+- Seek confirmation remains as fallback after playback starts.
+- Added visible Discovery-menu refresh after player stop.
+- When Player Stop disables Discovery mode while the Discovery screen is open, the menu is refreshed so stopped state is reflected.
+- Discovery state now records whether `StartOffset` was requested.
+
+## Version 1.0.67
+
+- Fixed Discovery mode stop handling by adding a `xbmc.Player` callback monitor.
+- Player Stop now disables Discovery mode through `onPlayBackStopped()`.
+- Player Error also disables Discovery mode.
+- Kept the existing polling stop detection as a fallback.
+- Added an internal playback-change guard so Discovery mode does not stop itself while switching songs.
+- Fixed Discovery offset seeking by confirming the seek result.
+- Discovery mode now retries `Player.seekTime()` several times and verifies `Player.getTime()`.
+- Added JSON-RPC `Player.Seek` fallback if `seekTime()` is not confirmed.
+- Discovery state now records `current_seek_confirmed`.
+
+## Version 1.0.66
+
+- Fixed Discovery mode starting excerpts at offset 0 when Kodi library duration is missing or zero.
+- Discovery mode now falls back to `Player.getTotalTime()` after playback starts.
+- The seek is applied after the player reports a usable duration.
+- Offset diagnostics now record `current_duration_seconds` and `current_offset_seconds` in the Discovery state file.
+- Navigation fixes from 1.0.64/1.0.65 are preserved.
+
+## Version 1.0.65
+
+- Restored Discovery mode offset/seek behavior from 1.0.60.
+- Replaced `start_discovery_song()` with the 1.0.60 implementation.
+- Removed the additional post-seek state guard that was introduced later and could interfere with the working offset behavior.
+- Kept the 1.0.64 navigation fix that prevents Backspace from reactivating Discovery mode.
+
+## Version 1.0.64
+
+- Fixed Backspace/navigation reactivating Discovery mode.
+- Discovery control actions now replace the current container with the canonical Discovery mode menu URL.
+- After creating a mix from Discovery mode, the current container is replaced with the canonical mix browse URL.
+- Added service-side stale-start-command protection.
+- Offset calculation/playback logic is intentionally left unchanged from the working Discovery implementation.
+
+## Version 1.0.63
+
+- Fixed Discovery mode immediately stopping/restarting after start.
+- Starting Discovery mode now clears stale stop markers such as `manual_stop`, `player_stop` or `mix_from_discovery_song`.
+- Skipping to the next discovery song also clears stale stop markers.
+- The service race guard now aborts a starting discovery song only when the latest state is actually disabled.
+- This prevents an old `stop_reason` from cancelling a fresh Discovery mode start.
+
+## Version 1.0.62
+
+- Discovery mode now stops when Kodi player playback is stopped by the user.
+- Added service-side detection for player stop while Discovery mode is active.
+- **Create mix from current discovery song** now asks for mix generation first.
+- If the user cancels mix generation, Discovery mode continues.
+- Discovery mode is stopped only after the user actually confirms mix generation.
+- After creating a mix from Discovery mode, Discovery mode remains off even after playback stop and navigation back.
+- Added stronger stop markers (`stop_reason`, `resume_allowed=false`) to prevent Discovery mode from being re-enabled by a stale service tick.
+
+## Version 1.0.61
+
+- Fixed Discovery mode menu entries that behaved like selectable no-op/status rows.
+- Discovery mode menu now contains only real actions.
+- Removed selectable status and excerpt/offset rows from the Discovery mode menu.
+- Added **Discovery mode settings** action.
+- Creating a mix from the current discovery song now stops Discovery mode more robustly.
+- The generated mix is now started as a Kodi music playlist immediately after creation.
+- Added a race-condition guard in the service so a started discovery excerpt cannot re-enable Discovery mode after the UI has stopped it.
+- The current discovery song is shown in the plugin category title when the Discovery mode menu is opened.
+
+## Version 1.0.60
+
+- Added first version of **Discovery mode**.
+- Discovery mode is service-driven and controlled through state/command files.
+- Added root menu entry **Discovery mode**.
+- Added Discovery mode actions:
+  - Start discovery mode
+  - Stop discovery mode
+  - Skip to next discovery song
+  - Create mix from current discovery song
+- Discovery mode plays random songs from the Kodi music library.
+- Each song is played as a short excerpt.
+- Added separate **Discovery mode** settings section.
+- Added configurable excerpt length, default 20 seconds.
+- Added configurable start offset into the song, default 33%.
+- Creating a mix from the current discovery song stops Discovery mode first.
+- Crossfade is not changed yet; this first version focuses on stable playback control.
+
+## Version 1.0.59
+
+- More like this and Less like this no longer show the pre-generation parameter dialog.
+- More/Less now use the configured default mix parameters directly.
+- Mix generation parameters are now recorded in the sidecar metadata under `mix_generation_parameters`.
+- Added a mix information dialog showing seed, track count, saved/modified timestamps, generation parameters, consistency and repair-readiness state.
+- Added **Information** / **Show mix information** context actions for saved mixes.
+- Saved mix list items now expose `MusicIP.CachePath`, `InfoAction` and sidecar text properties for Kodi information/keymap integration.
+- Added `mix_info_selected` action, which can be used by a Kodi keymap to show information for the currently selected saved mix.
+- Numeric mix parameter edits now use Kodi slider dialogs where available, with numeric input as fallback.
+- Style remains mapped from UI range `0..10` to MusicIP API range `0..200`.
+
+## Version 1.0.58
+
+- Fixed empty page when selecting **Generate MusicIP mix**.
+- Replaced the fragile custom `WindowDialog` pre-generation form with Kodi standard dialogs.
+- The explicit Cancel list entry remains removed; cancellation uses the normal window/back action.
+- Parameters remain editable before generation:
+  - mix size
+  - style
+  - variety
+  - seed-genre restriction
+  - MusicIP filter
+  - artist-repeat restriction
+- Style stays on the `0..10` UI scale and is mapped to the MusicIP API range `0..200`.
+
+## Version 1.0.57
+
+- Reworked the pre-generation mix-parameter dialog.
+- Removed the explicit **Cancel** option from the parameter list; cancellation now uses the normal window/back action.
+- The dialog now uses visible controls instead of a scrolling edit menu:
+  - sliders for mix size, style, variety and artist-repeat size
+  - radio button for seed-genre restriction
+  - text field for MusicIP filter
+  - button for **Generate mix**
+- All mix options are visible at once.
+- Style preference is explicitly mapped from UI range `0..10` to MusicIP API range `0..200`.
+- The MusicIP API request normalizes parameters before building the query string.
+
+## Version 1.0.56
+
+- Mix parameters are now adjustable immediately before mix generation.
+- The pre-generation dialog now shows:
+  - Generate mix
+  - Cancel
+  - editable size
+  - editable style
+  - editable variety
+  - toggle for seed-genre restriction
+  - editable MusicIP filter
+  - editable artist-repeat restriction
+- The style setting now supports values from 0 to 10 in steps of 1.
+- Style labels were expanded for all values from 0 to 10.
+- The edited one-time parameters are used for the MusicIP API request without changing the saved configuration.
+
+## Version 1.0.55
+
+- Added **Mix parameters** configuration section.
+- Added configurable MusicIP mix parameters:
+  - mix size
+  - style preference
+  - variety
+  - restrict to seed genre
+  - MusicIP filter
+  - artist-repeat rejection size
+- Reject type is fixed to `tracks`.
+- Artist-repeat setting is shown as “do not repeat artist within N tracks”.
+- Style is configured on a 0..10 scale in steps of 2 and mapped to the MusicIP API range 0..200.
+- Before mix generation, the add-on shows a parameter summary dialog with **Generate mix** and **Cancel**.
+- Mix API requests now send explicit `sizetype=tracks`, `style`, `variety`, `mixgenre`, optional `filter`, optional `rejectsize`, fixed `rejecttype=tracks`, and `content=text`.
+
+## Version 1.0.54
+
+- Fixed Recent Mixes ordering after auto-repair.
+- Recent mixes are no longer sorted by the `.m3u` filesystem modification time.
+- Sorting now uses the stable sidecar `updated_ts` value.
+- `updated_ts` remains the visible date/order timestamp.
+- `modified_ts` continues to record repair/edit time without moving the mix inside its date group.
+- This keeps the order of mixes inside a date group stable after automatic or manual repair.
+
+## Version 1.0.53
+
+- Renamed the consistency-check setting label from **Enable automatic service repair** to **Enable automatic mix repair**.
+- The setting id remains unchanged to preserve existing user configuration.
+- Fixed service auto-repair import failure caused by `main.py` expecting Kodi plugin arguments when imported from the service context.
+- `HANDLE` and `BASE_URL` are now guarded so repair helper functions can be imported by the service.
+- Service auto-repair still performs no dialogs and only runs when enabled and repair readiness is `ready`.
+
+## Version 1.0.52
+
+- Added optional automatic repair in the consistency service.
+- New consistency-check setting: **Enable automatic service repair**.
+- Default is disabled.
+- Service auto-repair only runs when repair readiness is `ready`.
+- Service auto-repair performs no dialogs and no user interaction.
+- Primary one-candidate repairs can be performed automatically.
+- Fallback repairs require exactly one safe high-confidence candidate.
+- Fallback auto-repair requires score >= 120, score gap >= 35, strong title match and no track-number mismatch.
+- If no safe automatic repair is available, the mix remains unchanged.
+
+## Version 1.0.51
+
+- Tightened auto-repair fallback scoring to avoid optimistic false repairs.
+- Added parser support for filenames like `Artist - Album - 12 - Title`.
+- Fallback auto-selection now requires a strong title match and no track-number mismatch.
+- Fallback auto-selection threshold changed to score >= 120 and gap >= 35.
+- Album, artist, year and folder hints are now ranking evidence only; they are no longer enough for automatic fallback repair.
+- Removed broad fallback queries for top-level/category terms such as `music` and `modernrock`.
+- Update-library dialog now shows raw Kodi library timestamps: last updated, last cleaned, songs last added and songs modified.
+- Update-library dialog now offers Kodi library maintenance actions: scan, cleanup, or scan then cleanup.
+
+## Version 1.0.50
+
+- Fixed repair-readiness gating when new missing tracks are added after a prior library scan.
+- Repair readiness now compares the Kodi audio-library timestamp against the latest relevant inconsistency timestamp, not only `first_inconsistent_ts`.
+- The required timestamp is now the maximum of:
+  - `first_inconsistent_ts`
+  - `last_inconsistency_change_ts`
+  - all per-track `first_missing_ts` values
+- If a new missing track is detected after the latest Kodi library update, **Auto-repair this mix** is hidden and **Update library before repair** is shown.
+- The update-library dialog now shows first inconsistency, latest inconsistency change, required library timestamp, and latest library timestamp.
+
+## Version 1.0.49
+
+- Fixed stale repair-readiness state in the Recent Mixes UI.
+- Inconsistent mixes now recalculate `repair_readiness` when they are rendered, so a recent Kodi library scan is reflected immediately.
+- The service still writes `repair_readiness`, but the UI no longer trusts an old sidecar value when deciding whether to show **Auto-repair this mix**.
+- Improved **Update library before repair** behavior: if the library is now current enough, the dialog says that repair is available and asks the user to reopen the context menu.
+- This avoids needing a Kodi restart after updating the music library.
+
+## Version 1.0.48
+
+- The consistency service now also derives and writes `repair_readiness` into the sidecar metadata.
+- Repair readiness is calculated from the current consistency state and Kodi audio-library freshness timestamps.
+- The Recent Mixes UI now uses existing service-calculated `repair_readiness` when available.
+- Plugin-side readiness calculation remains as fallback and for explicit actions.
+- This makes repair readiness a service-maintained state instead of depending only on user navigation.
+
+## Version 1.0.47
+
+- Fixed the repair-readiness datetime parser again.
+- The 1.0.46 regex was over-escaped and did not match valid Kodi values such as `2026-05-08 22:16:17`.
+- The parser now uses `[0-9]` ranges instead of escaped digit tokens.
+- Added extended plugin logging for successful Kodi datetime parsing.
+- Repair readiness behavior is otherwise unchanged.
+
+## Version 1.0.46
+
+- Replaced the repair-readiness timestamp parser again.
+- Kodi audio-library timestamps are now parsed by a direct regex + `datetime` parser.
+- This avoids the `time.strptime(...)` path used in 1.0.45, which still produced zero timestamps on the tested Kodi setup.
+- Raw Kodi values such as `2026-05-08 22:16:17` should now produce non-zero Unix timestamps in `library_timestamps`.
+- Repair readiness behavior is otherwise unchanged.
+
+## Version 1.0.45
+
+- Fixed repair-readiness timestamp parsing.
+- Kodi audio-library freshness values from `AudioLibrary.GetProperties` are now parsed correctly instead of producing `0`.
+- Library freshness timestamps are treated as UTC-like values for comparison with `time.time()` sidecar timestamps.
+- Added extended plugin logging for raw and parsed Kodi audio-library freshness properties.
+- This fixes the case where `library_properties` contained valid dates but `library_timestamps` were all zero.
+
+## Version 1.0.44
+
+- Added first-inconsistency tracking for saved-mix consistency metadata.
+- Sidecar metadata now keeps `first_inconsistent_ts`, `last_inconsistency_change_ts`, `missing_signature`, and per-track `first_missing_ts`.
+- `first_inconsistent_ts` is preserved while the same inconsistent state remains active.
+- `last_inconsistency_change_ts` changes when the missing-path signature changes.
+- Added repair-readiness checks based on Kodi audio-library freshness timestamps.
+- **Auto-repair this mix** is only shown when the Kodi audio library is newer than the first detected inconsistency.
+- If repair is not ready, the context menu shows **Update library before repair** instead.
+- The repair action itself now also checks readiness before running.
+- Added a dialog explaining why the Kodi library should be updated before repair.
+
+## Version 1.0.43
+
+- Improved auto-repair candidate discovery while keeping the existing strategy as the primary path.
+- Auto-repair still first tries the current exact-filename JSON-RPC lookup.
+- Broader fallback heuristics now run only when the primary lookup returns no candidates.
+- Added tolerant filename parsing for leading track numbers, trailing years, bracketed years, and ambiguous `artist - title` / `title - artist` forms.
+- Added fallback candidate collection through broader Kodi JSON-RPC contains searches.
+- Added fallback scoring based on title, artist, filename stem, year, track number, and weak folder/album hints.
+- Fallback candidates are auto-selected only when the score is high and clearly above the second-best candidate.
+- Ambiguous fallback candidates are shown ranked by score with reasons in the selection dialog.
+- Extended plugin logging now records primary lookup, fallback hints, fallback queries, scores, reasons, and decisions.
+
 ## Version 1.0.42
 
 - Fixed plugin-side extended logging crash caused by missing `get_setting_bool(...)` in `main.py`.

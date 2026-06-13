@@ -3,10 +3,14 @@
 
 from __future__ import annotations
 
+import calendar
+import datetime
 import glob
 import hashlib
 import json
 import os
+import random
+import re
 import sys
 import time
 import unicodedata
@@ -24,8 +28,10 @@ import xbmcvfs
 ADDON = xbmcaddon.Addon()
 ADDON_ID = ADDON.getAddonInfo("id")
 ADDON_NAME = ADDON.getAddonInfo("name")
-HANDLE = int(sys.argv[1])
-BASE_URL = sys.argv[0]
+HANDLE = int(sys.argv[1]) if len(sys.argv) > 1 and str(sys.argv[1]).lstrip("-").isdigit() else -1
+BASE_URL = sys.argv[0] if len(sys.argv) > 0 else ""
+
+LAST_MIX_GENERATION_PARAMS: dict[str, dict] = {}
 
 
 class MusicIPError(Exception):
@@ -47,6 +53,10 @@ def log_info(message: str) -> None:
 
 def addon_url(**query: str) -> str:
     return f"{BASE_URL}?{urlencode(query)}"
+
+
+def run_plugin_url(**query: str) -> str:
+    return f"RunPlugin({addon_url(**query)})"
 
 
 def notify(message: str, level=xbmcgui.NOTIFICATION_INFO) -> None:
@@ -92,6 +102,279 @@ def get_timeout() -> int:
     return max(1, timeout)
 
 
+def get_mix_style_preference() -> int:
+    value = get_setting_int("mix_style_preference", 2)
+    return max(0, min(10, value))
+
+
+def get_mix_style_api_value() -> int:
+    # MusicIP API style range: 0..200.
+    # UI scale: 0..10 in steps of 1.
+    return get_mix_style_preference() * 20
+
+
+def get_mix_style_label(value: int | None = None) -> str:
+    raw_value = get_mix_style_preference() if value is None else int(value)
+    ui_value = max(0, min(10, raw_value))
+    labels = {
+        0: "ignore",
+        1: "barely noticeable",
+        2: "weak preference",
+        3: "light preference",
+        4: "mild preference",
+        5: "medium preference",
+        6: "balanced preference",
+        7: "clear preference",
+        8: "strong preference",
+        9: "very strong preference",
+        10: "strongly prefer",
+    }
+    return labels.get(ui_value, f"{ui_value}/10")
+
+
+def get_mix_variety() -> int:
+    return max(0, min(9, get_setting_int("mix_variety", 0)))
+
+
+def get_mix_reject_size() -> int:
+    return max(0, min(20, get_setting_int("mix_reject_size", 0)))
+
+
+def get_mix_filter() -> str:
+    return get_setting("mix_filter", "").strip()
+
+
+def get_mix_genre_enabled() -> bool:
+    return get_setting_bool("mix_genre", False)
+
+
+def get_effective_mix_parameters(size_override: int | None = None) -> dict:
+    size = max(1, int(size_override or get_playlist_size()))
+    reject_size = get_mix_reject_size()
+    style_ui = get_mix_style_preference()
+    return {
+        "size": size,
+        "sizetype": "tracks",
+        "style": style_ui * 20,
+        "style_ui": style_ui,
+        "style_label": get_mix_style_label(style_ui),
+        "variety": get_mix_variety(),
+        "mixgenre": get_mix_genre_enabled(),
+        "filter": get_mix_filter(),
+        "rejectsize": reject_size,
+        "rejecttype": "tracks",
+        "content": "text",
+    }
+
+
+def normalize_mix_parameters(params: dict) -> dict:
+    normalized = dict(params or {})
+    normalized["size"] = max(1, min(100, int(normalized.get("size") or get_playlist_size())))
+    normalized["style_ui"] = max(0, min(10, int(normalized.get("style_ui") or 0)))
+    normalized["style"] = max(0, min(200, int(normalized["style_ui"]) * 20))
+    normalized["style_label"] = get_mix_style_label(int(normalized["style_ui"]))
+    normalized["variety"] = max(0, min(9, int(normalized.get("variety") or 0)))
+    normalized["mixgenre"] = bool(normalized.get("mixgenre"))
+    normalized["filter"] = str(normalized.get("filter") or "").strip()
+    normalized["rejectsize"] = max(0, min(20, int(normalized.get("rejectsize") or 0)))
+    normalized["rejecttype"] = "tracks"
+    normalized["sizetype"] = "tracks"
+    normalized["content"] = "text"
+    return normalized
+
+
+def compact_mix_generation_parameters(params: dict) -> dict:
+    normalized = normalize_mix_parameters(params)
+    return {
+        "size": int(normalized.get("size") or 0),
+        "sizetype": "tracks",
+        "style_ui": int(normalized.get("style_ui") or 0),
+        "style": int(normalized.get("style") or 0),
+        "style_label": str(normalized.get("style_label") or ""),
+        "variety": int(normalized.get("variety") or 0),
+        "mixgenre": bool(normalized.get("mixgenre")),
+        "filter": str(normalized.get("filter") or ""),
+        "rejectsize": int(normalized.get("rejectsize") or 0),
+        "rejecttype": "tracks",
+        "content": "text",
+    }
+
+
+def remember_mix_generation_parameters(seed: str, size: int, params: dict) -> None:
+    try:
+        LAST_MIX_GENERATION_PARAMS[mix_cache_key(seed, size)] = compact_mix_generation_parameters(params)
+    except Exception:
+        pass
+
+
+def pop_mix_generation_parameters(seed: str, size: int) -> dict:
+    try:
+        return LAST_MIX_GENERATION_PARAMS.pop(mix_cache_key(seed, size), {})
+    except Exception:
+        return {}
+
+
+def build_mix_parameter_summary(params: dict) -> str:
+    params = normalize_mix_parameters(params)
+    reject_size = int(params.get("rejectsize") or 0)
+    reject_text = (
+        f"do not repeat artist within {reject_size} tracks"
+        if reject_size > 0
+        else "disabled"
+    )
+    filter_value = str(params.get("filter") or "").strip() or "<none>"
+
+    lines = [
+        f"Size: {int(params.get('size') or 0)} tracks",
+        f"Style: {int(params.get('style_ui') or 0)}/10 - {params.get('style_label')}",
+        f"MusicIP style value: {int(params.get('style') or 0)}",
+        f"Variety: {int(params.get('variety') or 0)}",
+        f"Restrict to seed genre: {'yes' if params.get('mixgenre') else 'no'}",
+        f"Filter: {filter_value}",
+        f"Artist repeat: {reject_text}",
+    ]
+    return "\n".join(lines)
+
+
+def dialog_slider_int(default_value: int, heading: str, minimum: int, maximum: int, step: int = 1) -> int | None:
+    default_value = max(minimum, min(maximum, int(default_value)))
+    try:
+        result = xbmcgui.Dialog().slider(
+            heading,
+            default_value,
+            type=getattr(xbmcgui, "SLIDER_CONTROL_TYPE_INT", 1),
+            min=minimum,
+            delta=step,
+            max=maximum,
+        )
+    except Exception:
+        result = dialog_number(default_value, heading, minimum, maximum)
+
+    if result is None:
+        return None
+
+    try:
+        value = int(round(float(result)))
+    except (TypeError, ValueError):
+        return None
+
+    if value < minimum or value > maximum:
+        return None
+
+    return max(minimum, min(maximum, value))
+
+
+def dialog_number(default_value: int, heading: str, minimum: int, maximum: int) -> int | None:
+    value = xbmcgui.Dialog().numeric(0, heading, str(default_value))
+    if value is None or str(value).strip() == "":
+        return None
+
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+    return max(minimum, min(maximum, parsed))
+
+
+def edit_mix_generation_parameter(params: dict, option: int) -> dict:
+    updated = normalize_mix_parameters(params)
+
+    if option == 1:
+        value = dialog_slider_int(int(updated["size"]), "Mix size in tracks", 1, 100, 1)
+        if value is not None:
+            updated["size"] = value
+
+    elif option == 2:
+        value = dialog_slider_int(int(updated["style_ui"]), "Style preference 0..10", 0, 10, 1)
+        if value is not None:
+            updated["style_ui"] = value
+
+    elif option == 3:
+        value = dialog_slider_int(int(updated["variety"]), "Variety 0..9", 0, 9, 1)
+        if value is not None:
+            updated["variety"] = value
+
+    elif option == 4:
+        updated["mixgenre"] = not bool(updated.get("mixgenre"))
+
+    elif option == 5:
+        current = str(updated.get("filter") or "")
+        try:
+            value = xbmcgui.Dialog().input("MusicIP filter", defaultt=current)
+        except TypeError:
+            value = xbmcgui.Dialog().input("MusicIP filter", current)
+        if value is not None:
+            updated["filter"] = str(value).strip()
+
+    elif option == 6:
+        value = dialog_slider_int(int(updated["rejectsize"]), "Do not repeat artist within N tracks (0..20)", 0, 20, 1)
+        if value is not None:
+            updated["rejectsize"] = value
+
+    return normalize_mix_parameters(updated)
+
+
+def confirm_mix_generation(params: dict) -> dict | None:
+    current = normalize_mix_parameters(params)
+
+    while True:
+        filter_value = str(current.get("filter") or "").strip() or "<none>"
+        reject_size = int(current.get("rejectsize") or 0)
+        reject_label = (
+            f"do not repeat artist within {reject_size} tracks"
+            if reject_size > 0
+            else "disabled"
+        )
+
+        choices = [
+            "Generate mix",
+            f"Size: {int(current.get('size') or 0)} tracks",
+            f"Style: {int(current.get('style_ui') or 0)}/10 - {current.get('style_label')} (API {int(current.get('style') or 0)})",
+            f"Variety: {int(current.get('variety') or 0)}",
+            f"Restrict to seed genre: {'yes' if current.get('mixgenre') else 'no'}",
+            f"Filter: {filter_value}",
+            f"Artist repeat: {reject_label}",
+        ]
+
+        choice = xbmcgui.Dialog().select(
+            "Generate MusicIP mix",
+            choices,
+        )
+
+        if choice < 0:
+            return None
+        if choice == 0:
+            return normalize_mix_parameters(current)
+
+        current = edit_mix_generation_parameter(current, choice)
+
+
+def build_musicip_parameter_query(seed_song: str, params: dict) -> str:
+    params = normalize_mix_parameters(params)
+    encoded_seed = quote_from_bytes(seed_song.encode("iso-8859-1", errors="replace"))
+
+    query_params = {
+        "size": str(int(params.get("size") or get_playlist_size())),
+        "sizeType": "tracks",
+        "style": str(int(params.get("style") or 0)),
+        "variety": str(int(params.get("variety") or 0)),
+        "mixgenre": "true" if params.get("mixgenre") else "false",
+        "content": "text",
+    }
+
+    filter_value = str(params.get("filter") or "").strip()
+    if filter_value:
+        query_params["filter"] = filter_value
+
+    reject_size = int(params.get("rejectsize") or 0)
+    if reject_size > 0:
+        query_params["rejectsize"] = str(reject_size)
+        query_params["rejectType"] = "tracks"
+
+    return f"song={encoded_seed}&{urlencode(query_params)}"
+
+
 def parse_args() -> dict[str, str]:
     if len(sys.argv) < 3:
         return {}
@@ -103,6 +386,261 @@ def get_profile_dir() -> str:
     if not xbmcvfs.exists(profile):
         xbmcvfs.mkdirs(profile)
     return profile
+
+
+def discovery_state_path() -> str:
+    return os.path.join(get_profile_dir(), "discovery_mode_state.json")
+
+
+def discovery_command_path() -> str:
+    return os.path.join(get_profile_dir(), "discovery_mode_command.json")
+
+
+DISCOVERY_BUFFER_SIZE = 10
+
+
+def finish_plugin_action(success: bool = True) -> None:
+    try:
+        if HANDLE >= 0:
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=success, cacheToDisc=False)
+    except Exception:
+        pass
+
+
+def get_music_playlist() -> xbmc.PlayList:
+    return xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+
+
+def discovery_song_label_from_song(song: dict) -> str:
+    title = str(song.get("title") or "").strip()
+    artist = song.get("artist") or song.get("displayartist") or ""
+    if isinstance(artist, list):
+        artist = ", ".join(str(item) for item in artist if str(item).strip())
+    artist = str(artist or "").strip()
+
+    if artist and title:
+        return f"{artist} - {title}"
+    return title or path_to_label(str(song.get("file") or ""))
+
+
+def get_discovery_library_songs() -> list[dict]:
+    log("Discovery mode: UI loading Kodi music library songs for direct playlist start.", xbmc.LOGINFO)
+    try:
+        result = execute_jsonrpc(
+            "AudioLibrary.GetSongs",
+            {
+                "properties": ["title", "artist", "displayartist", "album", "duration", "file"],
+                "sort": {"method": "random"},
+            },
+        )
+    except Exception as exc:
+        log(f"Discovery mode: UI AudioLibrary.GetSongs with random sort failed: {exc}", xbmc.LOGWARNING)
+        try:
+            result = execute_jsonrpc(
+                "AudioLibrary.GetSongs",
+                {"properties": ["title", "artist", "displayartist", "album", "duration", "file"]},
+            )
+        except Exception as exc2:
+            log(f"Discovery mode: UI AudioLibrary.GetSongs fallback failed: {exc2}", xbmc.LOGERROR)
+            return []
+
+    songs = result.get("songs") or []
+    usable = [song for song in songs if str(song.get("file") or "").strip()]
+    log(f"Discovery mode: UI loaded {len(usable)} usable song(s).", xbmc.LOGINFO)
+    return usable
+
+
+def calculate_discovery_offset(duration: int, excerpt_seconds: int, offset_percent: int) -> int:
+    try:
+        duration = int(duration or 0)
+        excerpt_seconds = int(excerpt_seconds or 0)
+        offset_percent = int(offset_percent or 0)
+    except Exception:
+        return 0
+
+    if duration <= 0:
+        return 0
+
+    offset_seconds = int(duration * (offset_percent / 100.0))
+    if duration > excerpt_seconds + 2:
+        return min(offset_seconds, max(0, duration - excerpt_seconds - 2))
+    return 0
+
+
+def discovery_playlist_item(entry: dict) -> xbmcgui.ListItem:
+    label = str(entry.get("label") or path_to_label(str(entry.get("file") or "")))
+    item = xbmcgui.ListItem(label=label, offscreen=True)
+    try:
+        item.setProperty("StartOffset", str(int(entry.get("offset") or 0)))
+        item.setProperty("MusicIP.Discovery", "true")
+        item.setProperty("MusicIP.DiscoveryFile", str(entry.get("file") or ""))
+        item.setProperty("MusicIP.DiscoveryOffset", str(int(entry.get("offset") or 0)))
+    except Exception:
+        pass
+    apply_music_metadata(item, label)
+    return item
+
+
+def build_discovery_queue_from_library(excerpt_seconds: int, offset_percent: int, size: int = DISCOVERY_BUFFER_SIZE) -> list[dict]:
+    songs = get_discovery_library_songs()
+    if not songs:
+        return []
+
+    queue: list[dict] = []
+    attempts = 0
+    max_attempts = max(50, size * 10)
+
+    while len(queue) < size and attempts < max_attempts:
+        attempts += 1
+        song = random.choice(songs)
+        file_path = str(song.get("file") or "").strip()
+        if not file_path:
+            continue
+
+        try:
+            duration = int(song.get("duration") or 0)
+        except Exception:
+            duration = 0
+
+        offset = calculate_discovery_offset(duration, excerpt_seconds, offset_percent)
+        queue.append({
+            "file": file_path,
+            "label": discovery_song_label_from_song(song),
+            "duration": duration,
+            "offset": offset,
+            "songid": song.get("songid"),
+        })
+
+    log(f"Discovery mode: UI built direct playlist queue with {len(queue)} item(s).", xbmc.LOGINFO)
+    return queue
+
+
+def start_discovery_playlist_direct(state: dict) -> dict:
+    excerpt_seconds = int(state.get("excerpt_seconds") or get_discovery_excerpt_seconds())
+    offset_percent = int(state.get("offset_percent") or get_discovery_offset_percent())
+
+    playlist = get_music_playlist()
+    try:
+        playlist.clear()
+        log("Discovery mode: UI cleared Kodi music playlist.", xbmc.LOGINFO)
+    except Exception as exc:
+        log(f"Discovery mode: UI could not clear Kodi music playlist: {exc}", xbmc.LOGWARNING)
+
+    queue = build_discovery_queue_from_library(excerpt_seconds, offset_percent, DISCOVERY_BUFFER_SIZE)
+    if not queue:
+        state["enabled"] = False
+        state["startup_in_progress"] = False
+        state["last_error"] = "Discovery playlist could not be filled from Kodi music library."
+        save_discovery_state(state)
+        notify(state["last_error"], xbmcgui.NOTIFICATION_ERROR)
+        log(f"Discovery mode: {state['last_error']}", xbmc.LOGERROR)
+        return state
+
+    for entry in queue:
+        try:
+            playlist.add(str(entry.get("file") or ""), discovery_playlist_item(entry))
+        except Exception as exc:
+            log(f"Discovery mode: UI playlist add failed for {entry.get('file')!r}: {exc}", xbmc.LOGWARNING)
+
+    try:
+        playlist_size = playlist.size()
+    except Exception:
+        playlist_size = -1
+    log(f"Discovery mode: UI playlist prepared. queue={len(queue)}, kodi_playlist_size={playlist_size}.", xbmc.LOGINFO)
+
+    try:
+        xbmc.Player().play(playlist)
+        log("Discovery mode: UI called xbmc.Player().play(playlist).", xbmc.LOGINFO)
+    except Exception as exc:
+        state["enabled"] = False
+        state["startup_in_progress"] = False
+        state["last_error"] = f"Discovery playlist could not be started: {exc}"
+        save_discovery_state(state)
+        notify(state["last_error"], xbmcgui.NOTIFICATION_ERROR)
+        log(f"Discovery mode: {state['last_error']}", xbmc.LOGERROR)
+        return state
+
+    first = queue[0]
+    state.update({
+        "enabled": True,
+        "startup_in_progress": False,
+        "queue": queue,
+        "buffer_size": DISCOVERY_BUFFER_SIZE,
+        "current_playlist_position": 0,
+        "current_song": str(first.get("file") or ""),
+        "current_label": str(first.get("label") or path_to_label(str(first.get("file") or ""))),
+        "current_started_ts": int(time.time()),
+        "current_offset_seconds": int(first.get("offset") or 0),
+        "current_duration_seconds": int(first.get("duration") or 0),
+        "current_startoffset_requested": bool(int(first.get("offset") or 0) > 0),
+        "current_seek_confirmed": False,
+        "last_error": "",
+    })
+    save_discovery_state(state)
+    return state
+
+
+def get_discovery_excerpt_seconds() -> int:
+    return max(5, min(60, get_setting_int("discovery_excerpt_seconds", 20)))
+
+
+def get_discovery_offset_percent() -> int:
+    return max(0, min(90, get_setting_int("discovery_offset_percent", 33)))
+
+
+def get_discovery_state() -> dict:
+    return load_json_file(discovery_state_path())
+
+
+def save_discovery_state(state: dict) -> None:
+    save_json_file(discovery_state_path(), state or {})
+
+
+def write_discovery_command(command: str) -> None:
+    payload = {
+        "command": command,
+        "ts": int(time.time()),
+        "excerpt_seconds": get_discovery_excerpt_seconds(),
+        "offset_percent": get_discovery_offset_percent(),
+    }
+    save_json_file(discovery_command_path(), payload)
+
+
+def discovery_mode_is_active() -> bool:
+    return bool(get_discovery_state().get("enabled"))
+
+
+def discovery_current_song() -> str:
+    state = get_discovery_state()
+    return str(state.get("current_song") or "").strip()
+
+
+def discovery_mode_url() -> str:
+    return addon_url(action="discovery_mode", nonce=new_nonce())
+
+
+def replace_with_discovery_mode_menu() -> None:
+    try:
+        xbmc.executebuiltin(
+            f"Container.Update({addon_url(action='discovery_mode', nonce=new_nonce())},replace)"
+        )
+    except Exception as exc:
+        log(f"Discovery mode: could not replace container with Discovery screen: {exc}", xbmc.LOGWARNING)
+
+
+def refresh_discovery_mode_menu() -> None:
+    xbmc.executebuiltin(f"Container.Update({discovery_mode_url()},replace)")
+
+
+def discovery_status_label() -> str:
+    state = get_discovery_state()
+    if not state.get("enabled"):
+        return "Discovery mode: inactive"
+
+    current = str(state.get("current_label") or state.get("current_song") or "").strip()
+    if current:
+        return f"Discovery mode: active - {current}"
+    return "Discovery mode: active"
 
 
 def mix_cache_key(seed: str, size: int) -> str:
@@ -156,6 +694,12 @@ def save_mix(seed: str, size: int, tracks: list[str]) -> None:
         "label": path_to_label(seed),
         "updated_ts": int(time.time()),
     }
+
+    generation_params = pop_mix_generation_parameters(seed, size)
+    if generation_params:
+        meta["mix_generation_parameters"] = generation_params
+        meta["mix_generation_parameters_ts"] = int(time.time())
+
     save_json_file(mix_meta_path_from_cache_path(path), meta)
 
 
@@ -170,6 +714,8 @@ def save_mix_by_cache_path(cache_path: str, tracks: list[str]) -> None:
     meta = get_saved_mix_metadata(cache_path, tracks)
     original_updated_ts = int(meta.get("updated_ts") or 0)
     meta["track_count"] = len(tracks)
+    # Keep updated_ts stable. It is the visible ordering/date-group timestamp.
+    # Use modified_ts for repair/edit time instead.
     if original_updated_ts > 0:
         meta["updated_ts"] = original_updated_ts
     else:
@@ -195,10 +741,31 @@ def load_mix_by_cache_path(cache_path: str) -> list[str]:
     return [line.strip() for line in payload.splitlines() if line.strip()]
 
 
+def saved_mix_order_timestamp(cache_path: str) -> int:
+    try:
+        tracks = load_mix_by_cache_path(cache_path)
+        meta = get_saved_mix_metadata(cache_path, tracks)
+        updated_ts = int(meta.get("updated_ts") or 0)
+        if updated_ts > 0:
+            return updated_ts
+    except Exception:
+        pass
+
+    try:
+        return int(os.path.getmtime(cache_path))
+    except Exception:
+        return 0
+
+
 def list_saved_mix_cache_paths() -> list[str]:
     pattern = os.path.join(get_profile_dir(), "mix_*.m3u")
     paths = [path for path in glob.glob(pattern) if os.path.isfile(path)]
-    paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
+    # Do not sort by the M3U file modification time here.
+    # Auto-repair and More/Less like this rewrite the M3U and therefore change
+    # its filesystem mtime. The visible recent-mix order should remain based on
+    # the original saved timestamp in the sidecar metadata.
+    paths.sort(key=lambda p: (saved_mix_order_timestamp(p), os.path.basename(p)), reverse=True)
     return paths
 
 
@@ -277,6 +844,70 @@ def track_file_exists(path: str) -> bool:
         return False
 
 
+def missing_signature(missing: list[dict]) -> str:
+    payload = [
+        {
+            "index": int(item.get("index") or 0),
+            "path": str(item.get("path") or ""),
+        }
+        for item in missing
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()
+
+
+def build_consistency_payload(old_consistency: dict, tracks: list[str], missing: list[dict]) -> dict:
+    now = int(time.time())
+    checked_tracks = len(tracks)
+
+    if not missing:
+        return {
+            "status": "ok",
+            "checked_ts": now,
+            "checked_tracks": checked_tracks,
+            "missing_files": 0,
+            "missing": [],
+            "missing_signature": "",
+        }
+
+    signature = missing_signature(missing)
+    old_status = str(old_consistency.get("status") or "").lower()
+    old_signature = str(old_consistency.get("missing_signature") or "")
+    old_first = int(old_consistency.get("first_inconsistent_ts") or 0)
+    old_changed = int(old_consistency.get("last_inconsistency_change_ts") or 0)
+
+    first_inconsistent_ts = old_first if old_status == "inconsistent" and old_first > 0 else now
+    last_inconsistency_change_ts = old_changed or first_inconsistent_ts
+    if old_status != "inconsistent" or old_signature != signature:
+        last_inconsistency_change_ts = now
+
+    previous_missing = {}
+    for item in old_consistency.get("missing") or []:
+        path = str(item.get("path") or "")
+        if path:
+            previous_missing[path] = int(item.get("first_missing_ts") or first_inconsistent_ts)
+
+    enriched_missing: list[dict] = []
+    for item in missing:
+        path = str(item.get("path") or "")
+        enriched_missing.append({
+            "index": int(item.get("index") or 0),
+            "path": path,
+            "first_missing_ts": previous_missing.get(path, now),
+        })
+
+    return {
+        "status": "inconsistent",
+        "checked_ts": now,
+        "checked_tracks": checked_tracks,
+        "missing_files": len(enriched_missing),
+        "missing": enriched_missing,
+        "missing_signature": signature,
+        "first_inconsistent_ts": first_inconsistent_ts,
+        "last_inconsistency_change_ts": last_inconsistency_change_ts,
+    }
+
+
 def set_mix_consistency_metadata(cache_path: str, tracks: list[str], consistency: dict) -> None:
     meta = get_saved_mix_metadata(cache_path, tracks)
     meta["track_count"] = len(tracks)
@@ -286,6 +917,8 @@ def set_mix_consistency_metadata(cache_path: str, tracks: list[str], consistency
 
 def analyze_mix_consistency(cache_path: str) -> dict:
     tracks = load_mix_by_cache_path(cache_path)
+    meta = get_saved_mix_metadata(cache_path, tracks)
+    old_consistency = meta.get("consistency") if isinstance(meta.get("consistency"), dict) else {}
     missing: list[dict] = []
 
     for index, track in enumerate(tracks):
@@ -297,19 +930,266 @@ def analyze_mix_consistency(cache_path: str) -> dict:
             "path": track,
         })
 
-    consistency = {
-        "status": "ok" if not missing else "inconsistent",
-        "checked_ts": int(time.time()),
-        "checked_tracks": len(tracks),
-        "missing_files": len(missing),
-        "missing": missing,
-    }
+    consistency = build_consistency_payload(old_consistency, tracks, missing)
     set_mix_consistency_metadata(cache_path, tracks, consistency)
     return consistency
 
 
 def is_track_missing(path: str) -> bool:
     return not track_file_exists(path)
+
+
+def parse_kodi_datetime(value: object) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+
+    # Expected Kodi examples:
+    #   2026-05-08 22:16:17
+    #   2026-05-08T22:16:17Z
+    #   2026-05-08
+    #
+    # Use [0-9] explicitly to avoid backslash escaping issues in embedded regex strings.
+    match = re.search(
+        r"([0-9]{4})-([0-9]{2})-([0-9]{2})(?:[ T]([0-9]{2}):([0-9]{2})(?::([0-9]{2}))?)?",
+        text,
+    )
+    if not match:
+        log_info(f"Repair readiness: could not parse Kodi datetime value {text!r}")
+        return 0
+
+    try:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        hour = int(match.group(4) or 0)
+        minute = int(match.group(5) or 0)
+        second = int(match.group(6) or 0)
+        parsed = datetime.datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            tzinfo=datetime.timezone.utc,
+        )
+        timestamp = int(parsed.timestamp())
+        log_info(f"Repair readiness: parsed Kodi datetime {text!r} as timestamp {timestamp}")
+        return timestamp
+    except Exception as exc:
+        log_info(f"Repair readiness: failed to convert Kodi datetime {text!r}: {exc}")
+        return 0
+
+
+def format_ts_for_display(value: int) -> str:
+    ts = int(value or 0)
+    if ts <= 0:
+        return "unknown"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+
+def get_audio_library_freshness() -> dict:
+    properties = [
+        "librarylastupdated",
+        "librarylastcleaned",
+        "songslastadded",
+        "songsmodified",
+    ]
+
+    try:
+        result = execute_jsonrpc(
+            "AudioLibrary.GetProperties",
+            {"properties": properties},
+        )
+    except Exception as exc:
+        log_info(f"Repair readiness: could not read Kodi audio library properties: {exc}")
+        return {
+            "properties": {},
+            "timestamps": {},
+            "freshest_ts": 0,
+            "freshest_property": "",
+        }
+
+    timestamps = {}
+    for key in properties:
+        timestamps[key] = parse_kodi_datetime(result.get(key))
+        log_info(
+            f"Repair readiness: Kodi library property {key}="
+            f"{str(result.get(key) or '')!r}, parsed_ts={timestamps[key]}"
+        )
+
+    freshest_property = ""
+    freshest_ts = 0
+    for key, value in timestamps.items():
+        if value > freshest_ts:
+            freshest_ts = value
+            freshest_property = key
+
+    return {
+        "properties": {key: result.get(key, "") for key in properties},
+        "timestamps": timestamps,
+        "freshest_ts": freshest_ts,
+        "freshest_property": freshest_property,
+    }
+
+
+def get_repair_readiness_required_ts(consistency: dict) -> int:
+    values = [
+        int(consistency.get("first_inconsistent_ts") or 0),
+        int(consistency.get("last_inconsistency_change_ts") or 0),
+    ]
+
+    for item in consistency.get("missing") or []:
+        if isinstance(item, dict):
+            values.append(int(item.get("first_missing_ts") or 0))
+
+    return max(values) if values else 0
+
+
+def get_mix_repair_readiness(meta: dict) -> dict:
+    consistency = get_consistency_status(meta)
+    first_inconsistent_ts = int(consistency.get("first_inconsistent_ts") or 0)
+    last_inconsistency_change_ts = int(consistency.get("last_inconsistency_change_ts") or 0)
+    required_library_ts = get_repair_readiness_required_ts(consistency)
+
+    if not is_mix_inconsistent(meta):
+        return {
+            "status": "not_needed",
+            "reason": "Mix is not inconsistent.",
+            "checked_ts": int(time.time()),
+        }
+
+    freshness = get_audio_library_freshness()
+    freshest_ts = int(freshness.get("freshest_ts") or 0)
+    freshest_property = str(freshness.get("freshest_property") or "")
+
+    if required_library_ts <= 0:
+        status = "update_library_before_repair"
+        reason = "Required library freshness time is not known yet. Run consistency check again."
+    elif freshest_ts > required_library_ts:
+        status = "ready"
+        reason = "Kodi audio library is newer than the latest detected inconsistency."
+    elif freshest_ts <= 0:
+        status = "update_library_before_repair"
+        reason = "Kodi audio library freshness could not be determined."
+    else:
+        status = "update_library_before_repair"
+        reason = "Kodi audio library has not been updated since the latest detected inconsistency."
+
+    return {
+        "status": status,
+        "reason": reason,
+        "checked_ts": int(time.time()),
+        "first_inconsistent_ts": first_inconsistent_ts,
+        "last_inconsistency_change_ts": last_inconsistency_change_ts,
+        "required_library_ts": required_library_ts,
+        "library_freshest_ts": freshest_ts,
+        "library_freshest_property": freshest_property,
+        "library_properties": freshness.get("properties") or {},
+        "library_timestamps": freshness.get("timestamps") or {},
+    }
+
+
+def update_mix_repair_readiness_metadata(cache_path: str, tracks: list[str], meta: dict) -> dict:
+    readiness = get_mix_repair_readiness(meta)
+    updated_meta = dict(meta)
+    updated_meta["track_count"] = len(tracks)
+    updated_meta["repair_readiness"] = readiness
+    save_json_file(mix_meta_path_from_cache_path(cache_path), updated_meta)
+    return readiness
+
+
+def get_or_update_mix_repair_readiness(cache_path: str, tracks: list[str], meta: dict) -> dict:
+    # Repair readiness depends on Kodi library timestamps, which can change
+    # outside the add-on while Kodi keeps running. Recalculate it whenever an
+    # inconsistent mix is rendered, so the context menu reflects a recent scan
+    # immediately instead of waiting for the service interval or Kodi restart.
+    return update_mix_repair_readiness_metadata(cache_path, tracks, meta)
+
+
+def is_repair_ready(readiness: dict) -> bool:
+    return str(readiness.get("status") or "").lower() == "ready"
+
+
+def build_repair_readiness_message(readiness: dict) -> str:
+    first_ts = int(readiness.get("first_inconsistent_ts") or 0)
+    change_ts = int(readiness.get("last_inconsistency_change_ts") or 0)
+    required_ts = int(readiness.get("required_library_ts") or 0)
+    library_ts = int(readiness.get("library_freshest_ts") or 0)
+    property_name = str(readiness.get("library_freshest_property") or "")
+    reason = str(readiness.get("reason") or "")
+
+    lines = [
+        reason or "Kodi music library should be updated before repair.",
+        "",
+        f"First inconsistency: {format_ts_for_display(first_ts)}",
+        f"Latest inconsistency change: {format_ts_for_display(change_ts)}",
+        f"Required library timestamp: {format_ts_for_display(required_ts)}",
+        f"Latest library timestamp: {format_ts_for_display(library_ts)}",
+    ]
+    if property_name:
+        lines.append(f"Library property: {property_name}")
+
+    library_properties = readiness.get("library_properties") if isinstance(readiness.get("library_properties"), dict) else {}
+    if library_properties:
+        lines.extend([
+            "",
+            f"Library last updated: {library_properties.get('librarylastupdated') or 'unknown'}",
+            f"Library last cleaned: {library_properties.get('librarylastcleaned') or 'unknown'}",
+            f"Songs last added: {library_properties.get('songslastadded') or 'unknown'}",
+            f"Songs modified: {library_properties.get('songsmodified') or 'unknown'}",
+        ])
+
+    lines.extend([
+        "",
+        "Update and clean the Kodi music library, wait for the consistency service to run again, then try repair again.",
+    ])
+    return "\n".join(lines)
+
+
+def show_update_library_before_repair(cache_path: str) -> None:
+    tracks = load_mix_by_cache_path(cache_path)
+    meta = get_saved_mix_metadata(cache_path, tracks)
+    readiness = update_mix_repair_readiness_metadata(cache_path, tracks, meta)
+
+    if is_repair_ready(readiness):
+        xbmcgui.Dialog().ok(
+            "Repair is now available",
+            "Kodi audio library is newer than the latest detected inconsistency.\n\n"
+            "Close this dialog and reopen the context menu. "
+            "Auto-repair this mix should now be available.",
+        )
+        return
+
+    choice = xbmcgui.Dialog().select(
+        "Update library before repair",
+        [
+            "Show details only",
+            "Run Kodi music library scan",
+            "Run Kodi music library cleanup",
+            "Run scan, then cleanup",
+        ],
+    )
+
+    if choice == 1:
+        run_audio_library_maintenance("scan")
+    elif choice == 2:
+        run_audio_library_maintenance("clean")
+    elif choice == 3:
+        run_audio_library_maintenance("scan_clean")
+    elif choice < 0:
+        return
+
+    xbmcgui.Dialog().ok("Update library before repair", build_repair_readiness_message(readiness))
+
+
+def ensure_repair_ready(cache_path: str) -> None:
+    tracks = load_mix_by_cache_path(cache_path)
+    meta = get_saved_mix_metadata(cache_path, tracks)
+    readiness = update_mix_repair_readiness_metadata(cache_path, tracks, meta)
+    if not is_repair_ready(readiness):
+        raise MusicIPError("Update library before repair.")
 
 
 def format_saved_mix_label(meta: dict) -> str:
@@ -388,6 +1268,15 @@ def build_repair_mix_action(cache_path: str) -> str:
     return f"RunPlugin({repair_url})"
 
 
+def build_update_library_before_repair_action(cache_path: str) -> str:
+    update_url = addon_url(
+        action="update_library_before_repair",
+        cache_path=cache_path,
+        nonce=new_nonce(),
+    )
+    return f"RunPlugin({update_url})"
+
+
 def delete_saved_mix_files(cache_path: str) -> None:
     try:
         xbmcvfs.delete(cache_path)
@@ -440,14 +1329,12 @@ def get_current_seed_song() -> str:
     return seed_song
 
 
-def build_musicip_url(seed_song: str, size: int) -> str:
-    encoded_seed = quote_from_bytes(seed_song.encode("iso-8859-1", errors="replace"))
+def build_musicip_url(seed_song: str, size: int, mix_params: dict | None = None) -> str:
+    params = mix_params or get_effective_mix_parameters(size_override=size)
     host = get_server_host()
     port = get_server_port()
-    return (
-        f"http://{host}:{port}/api/mix"
-        f"?song={encoded_seed}&size={size}&sizeType=tracks&content=text"
-    )
+    query = build_musicip_parameter_query(seed_song, params)
+    return f"http://{host}:{port}/api/mix?{query}"
 
 
 def decode_response(data: bytes) -> str:
@@ -478,8 +1365,9 @@ def prepend_seed_track(seed_song: str, tracks: list[str]) -> list[str]:
     return result
 
 
-def fetch_mix(seed_song: str, size: int) -> list[str]:
-    url = build_musicip_url(seed_song, size)
+def fetch_mix(seed_song: str, size: int, mix_params: dict | None = None) -> list[str]:
+    params = mix_params or get_effective_mix_parameters(size_override=size)
+    url = build_musicip_url(seed_song, size, params)
     timeout = get_timeout()
 
     try:
@@ -490,6 +1378,7 @@ def fetch_mix(seed_song: str, size: int) -> list[str]:
     log(f"MusicIP seed raw: {seed_song!r}", xbmc.LOGDEBUG)
     log(f"MusicIP seed encoded: {encoded_seed!r}", xbmc.LOGDEBUG)
     log(f"MusicIP playlist size: {size}", xbmc.LOGDEBUG)
+    log(f"MusicIP mix parameters: {params!r}", xbmc.LOGDEBUG)
     log(f"MusicIP request URL: {url!r}", xbmc.LOGDEBUG)
     log(f"Requesting MusicIP mix: {url}")
 
@@ -522,6 +1411,22 @@ def fetch_mix(seed_song: str, size: int) -> list[str]:
         raise MusicIPError("MusicIP returned an empty mix.")
 
     return prepend_seed_track(seed_song, tracks)
+
+
+def fetch_mix_with_defaults(seed_song: str, size: int) -> list[str]:
+    params = get_effective_mix_parameters(size_override=size)
+    remember_mix_generation_parameters(seed_song, size, params)
+    return fetch_mix(seed_song, size, mix_params=params)
+
+
+def fetch_mix_confirmed(seed_song: str, size: int) -> list[str]:
+    params = get_effective_mix_parameters(size_override=size)
+    params = confirm_mix_generation(params)
+    if params is None:
+        raise MusicIPError("Mix generation cancelled.")
+
+    remember_mix_generation_parameters(seed_song, size, params)
+    return fetch_mix(seed_song, int(params.get("size") or size), mix_params=params)
 
 
 def path_to_label(path: str) -> str:
@@ -746,7 +1651,7 @@ def insert_more_like_this_into_mix(seed: str, size: int, index: int, path: str, 
         raise MusicIPError("Could not locate the selected track in the source mix.")
 
     target_count = get_more_like_this_target_size()
-    submix_tracks = fetch_mix(path, get_playlist_size())
+    submix_tracks = fetch_mix_with_defaults(path, get_playlist_size())
     existing = {
         normalize_track_identity(track)
         for track in source_tracks
@@ -791,7 +1696,7 @@ def remove_less_like_this_from_mix(seed: str, size: int, index: int, path: str, 
 
     target_count = get_more_like_this_target_size()
     submix_request_size = max(1, get_playlist_size() * 2)
-    submix_tracks = fetch_mix(path, submix_request_size)
+    submix_tracks = fetch_mix_with_defaults(path, submix_request_size)
     selected_seed_identity = normalize_track_identity(path)
 
     removable_matches: set[str] = set()
@@ -938,6 +1843,21 @@ def execute_jsonrpc(method: str, params: dict | None = None) -> dict:
     return response.get('result', {})
 
 
+def run_audio_library_maintenance(mode: str) -> None:
+    if mode == "scan":
+        execute_jsonrpc("AudioLibrary.Scan")
+        notify("Kodi music library scan started.")
+    elif mode == "clean":
+        execute_jsonrpc("AudioLibrary.Clean")
+        notify("Kodi music library cleanup started.")
+    elif mode == "scan_clean":
+        execute_jsonrpc("AudioLibrary.Scan")
+        execute_jsonrpc("AudioLibrary.Clean")
+        notify("Kodi music library scan and cleanup started.")
+    else:
+        notify("No library action selected.", xbmcgui.NOTIFICATION_WARNING)
+
+
 def split_full_path(path: str) -> tuple[str, str]:
     value = (path or '').strip().rstrip('/\\')
     if not value:
@@ -1071,20 +1991,407 @@ def get_unique_song_candidates(songs: list[dict]) -> list[dict]:
     return result
 
 
+def strip_audio_extension(value: str) -> str:
+    return re.sub(r"\.(mp3|flac|m4a|mp4|aac|ogg|opus|wav|aiff|ape|wma)$", "", value or "", flags=re.IGNORECASE).strip()
+
+
+def normalize_repair_text(value: object) -> str:
+    text = first_non_empty_text(value)
+    text = unicodedata.normalize("NFC", text)
+    text = unquote(text)
+    text = strip_audio_extension(text)
+    text = text.casefold()
+    text = re.sub(r"[\[\(]\s*(19|20)\d{2}\s*[\]\)]\s*$", " ", text)
+    text = re.sub(r"\b(19|20)\d{2}\b\s*$", " ", text)
+    text = re.sub(r"^\s*\d{1,3}\s*[\.\-_\)]\s*", " ", text)
+    text = re.sub(r"[_]+", " ", text)
+    text = re.sub(r"[^\w]+", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def add_unique_text(values: list[str], value: object) -> None:
+    text = normalize_repair_text(value)
+    if text and len(text) >= 3 and text not in values:
+        values.append(text)
+
+
+def extract_year_hint(value: str) -> int:
+    match = re.search(r"[\[\(]?\b((?:19|20)\d{2})\b[\]\)]?", value or "")
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return 0
+
+
+def extract_track_number_hint(value: str) -> int:
+    match = re.match(r"^\s*(\d{1,3})\s*[\.\-_\)]", value or "")
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return 0
+
+
+def split_artist_title_hints(stem: str) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    parts = re.split(r"\s+[-–—]\s+", stem or "", maxsplit=1)
+    if len(parts) != 2:
+        return result
+
+    left = normalize_repair_text(parts[0])
+    right = normalize_repair_text(parts[1])
+    if left and right:
+        result.append((left, right))
+        result.append((right, left))
+
+    return result
+
+
+def directory_hint_values(directory: str) -> list[str]:
+    value = canonical_audio_path(directory)
+    parts = [part for part in value.split("/") if part]
+    result: list[str] = []
+
+    for part in parts[-4:]:
+        cleaned = re.sub(r"^#+", "", part)
+        cleaned = re.sub(r"[\[\(]?\b(19|20)\d{2}\b[\]\)]?", " ", cleaned)
+        add_unique_text(result, cleaned)
+
+    return result
+
+
+def parse_structured_filename_hints(stem: str) -> dict:
+    parts = [part.strip() for part in re.split(r"\s+[-–—]\s+", stem or "") if part.strip()]
+    result = {"artist": "", "album": "", "title": "", "track_number": 0}
+
+    # Common pattern: Artist - Album - 12 - Title
+    if len(parts) >= 4 and re.fullmatch(r"\d{1,3}", parts[-2]):
+        result["artist"] = normalize_repair_text(parts[0])
+        result["album"] = normalize_repair_text(" - ".join(parts[1:-2]))
+        result["track_number"] = int(parts[-2])
+        result["title"] = normalize_repair_text(parts[-1])
+        return result
+
+    # Also accept: Artist - Album - 12 Title
+    if len(parts) >= 3:
+        match = re.match(r"^\s*(\d{1,3})\s+(.+)$", parts[-1])
+        if match:
+            result["artist"] = normalize_repair_text(parts[0])
+            result["album"] = normalize_repair_text(" - ".join(parts[1:-1]))
+            result["track_number"] = int(match.group(1))
+            result["title"] = normalize_repair_text(match.group(2))
+            return result
+
+    return result
+
+
+def repair_tokens(value: object) -> set[str]:
+    return {token for token in normalize_repair_text(value).split() if len(token) >= 2}
+
+
+def is_strong_text_match(expected: str, actual: str) -> bool:
+    expected_norm = normalize_repair_text(expected)
+    actual_norm = normalize_repair_text(actual)
+    if not expected_norm or not actual_norm:
+        return False
+    if expected_norm == actual_norm:
+        return True
+
+    expected_tokens = repair_tokens(expected_norm)
+    actual_tokens = repair_tokens(actual_norm)
+    if not expected_tokens or not actual_tokens:
+        return False
+
+    overlap = expected_tokens & actual_tokens
+    if len(overlap) < 2:
+        return False
+
+    coverage_actual = len(overlap) / max(1, len(actual_tokens))
+    coverage_expected = len(overlap) / max(1, len(expected_tokens))
+    return coverage_actual >= 0.80 and coverage_expected >= 0.60
+
+
+def build_repair_hints(old_path: str) -> dict:
+    filename, directory = split_full_path(old_path)
+    stem = strip_audio_extension(filename)
+    stem_no_track = re.sub(r"^\s*\d{1,3}\s*[\.\-_\)]\s*", "", stem or "").strip()
+    stem_no_year = re.sub(r"[\[\(]?\b(19|20)\d{2}\b[\]\)]?\s*$", "", stem_no_track).strip()
+
+    structured = parse_structured_filename_hints(stem_no_year)
+
+    possible_titles: list[str] = []
+    possible_artists: list[str] = []
+    possible_albums: list[str] = []
+    search_terms: list[str] = []
+
+    if structured.get("title"):
+        add_unique_text(possible_titles, structured.get("title"))
+        add_unique_text(search_terms, structured.get("title"))
+    if structured.get("artist"):
+        add_unique_text(possible_artists, structured.get("artist"))
+        add_unique_text(search_terms, structured.get("artist"))
+    if structured.get("album"):
+        add_unique_text(possible_albums, structured.get("album"))
+        add_unique_text(search_terms, structured.get("album"))
+
+    if not structured.get("title"):
+        add_unique_text(possible_titles, stem_no_year)
+        add_unique_text(possible_titles, stem_no_track)
+        add_unique_text(search_terms, stem_no_year)
+        add_unique_text(search_terms, stem_no_track)
+
+        pairs = split_artist_title_hints(stem_no_year)
+        for possible_artist, possible_title in pairs:
+            add_unique_text(possible_artists, possible_artist)
+            add_unique_text(possible_titles, possible_title)
+            add_unique_text(search_terms, possible_artist)
+            add_unique_text(search_terms, possible_title)
+
+    folder_hints = directory_hint_values(directory)
+    for hint in folder_hints:
+        if hint not in {"music", "modernrock", "rock", "compilations", "various artists"}:
+            add_unique_text(search_terms, hint)
+
+    year = extract_year_hint(stem) or extract_year_hint(directory)
+    track_number = int(structured.get("track_number") or 0) or extract_track_number_hint(stem)
+
+    return {
+        "old_path": old_path,
+        "filename": filename,
+        "stem": stem,
+        "track_number": track_number,
+        "year": year,
+        "possible_titles": possible_titles,
+        "possible_artists": possible_artists,
+        "possible_albums": possible_albums,
+        "folder_hints": folder_hints,
+        "search_terms": search_terms[:8],
+    }
+
+
+def query_library_songs_contains(field: str, value: str) -> list[dict]:
+    term = (value or "").strip()
+    if not term:
+        return []
+
+    try:
+        result = execute_jsonrpc(
+            'AudioLibrary.GetSongs',
+            {
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'track', 'thumbnail', 'fanart'],
+                'filter': {'field': field, 'operator': 'contains', 'value': term},
+            },
+        )
+    except Exception as exc:
+        log_info(f"Auto-repair fallback: Kodi lookup failed for {field} contains {term!r}: {exc}")
+        return []
+
+    return result.get('songs') or []
+
+
+def collect_fallback_repair_candidates(hints: dict) -> list[dict]:
+    raw_candidates: list[dict] = []
+    seen_queries: set[tuple[str, str]] = set()
+
+    def run_query(field: str, value: str) -> None:
+        normalized_value = normalize_repair_text(value)
+        if len(normalized_value) < 3:
+            return
+        if normalized_value in {"music", "modernrock", "rock", "compilations", "various artists"}:
+            log_info(f"Auto-repair fallback: skipping broad query term {normalized_value!r}")
+            return
+
+        query_key = (field, normalized_value)
+        if query_key in seen_queries:
+            return
+
+        seen_queries.add(query_key)
+        log_info(f"Auto-repair fallback: query {field} contains {normalized_value!r}")
+        result = query_library_songs_contains(field, normalized_value)
+        log_info(f"Auto-repair fallback: query returned {len(result)} candidate(s).")
+        raw_candidates.extend(result)
+
+    for term in hints.get("search_terms") or []:
+        run_query("title", term)
+        run_query("filename", term)
+
+    for title in hints.get("possible_titles") or []:
+        run_query("title", title)
+
+    for artist in hints.get("possible_artists") or []:
+        run_query("artist", artist)
+
+    for folder_hint in hints.get("folder_hints") or []:
+        # Folder hints are weak evidence only. Query album, never artist.
+        run_query("album", folder_hint)
+
+    unique_candidates = get_unique_song_candidates(raw_candidates)
+    log_info(
+        f"Auto-repair fallback: collected {len(raw_candidates)} raw candidate(s), "
+        f"{len(unique_candidates)} unique candidate(s)."
+    )
+    return unique_candidates
+
+
+def candidate_artist_values(song: dict) -> list[str]:
+    values: list[str] = []
+    for key in ("artist", "displayartist", "albumartist"):
+        value = song.get(key)
+        if isinstance(value, list):
+            for item in value:
+                add_unique_text(values, item)
+        else:
+            add_unique_text(values, value)
+    return values
+
+
+def candidate_file_stem(song: dict) -> str:
+    return normalize_repair_text(path_to_label(str(song.get("file") or "")))
+
+
+def score_repair_candidate(song: dict, hints: dict) -> tuple[int, list[str], bool]:
+    score = 0
+    reasons: list[str] = []
+    strong_title_match = False
+    strong_track_mismatch = False
+
+    candidate_title = normalize_repair_text(song.get("title"))
+    candidate_album = normalize_repair_text(song.get("album"))
+    candidate_artists = candidate_artist_values(song)
+    candidate_file = candidate_file_stem(song)
+    possible_titles = hints.get("possible_titles") or []
+    possible_artists = hints.get("possible_artists") or []
+    possible_albums = hints.get("possible_albums") or []
+    folder_hints = hints.get("folder_hints") or []
+
+    def add(points: int, reason: str) -> None:
+        nonlocal score
+        score += points
+        reasons.append(f"+{points} {reason}")
+
+    def subtract(points: int, reason: str) -> None:
+        nonlocal score
+        score -= points
+        reasons.append(f"-{points} {reason}")
+
+    for title in possible_titles:
+        if is_strong_text_match(title, candidate_title):
+            add(90, f"strong title match {title!r}")
+            strong_title_match = True
+            break
+
+    if not strong_title_match:
+        for title in possible_titles:
+            if is_strong_text_match(title, candidate_file):
+                add(70, f"strong filename title match {title!r}")
+                strong_title_match = True
+                break
+
+    if possible_artists and candidate_artists:
+        for artist in possible_artists:
+            if artist in candidate_artists:
+                add(35, f"artist match {artist!r}")
+                break
+        else:
+            for artist in possible_artists:
+                if any(is_strong_text_match(artist, candidate_artist) for candidate_artist in candidate_artists):
+                    add(20, f"artist partial match {artist!r}")
+                    break
+
+    for album in possible_albums:
+        if album and candidate_album == album:
+            add(25, f"album match {album!r}")
+            break
+
+    hint_year = int(hints.get("year") or 0)
+    candidate_year = parse_year(song.get("year"))
+    if hint_year and candidate_year and hint_year == candidate_year:
+        add(20, f"year match {hint_year}")
+
+    hint_track = int(hints.get("track_number") or 0)
+    candidate_track = parse_track_number(song.get("track"))
+    if hint_track and candidate_track:
+        if hint_track == candidate_track:
+            add(40, f"track number match {hint_track}")
+        else:
+            strong_track_mismatch = True
+            subtract(80, f"track number mismatch expected {hint_track}, got {candidate_track}")
+
+    for folder_hint in folder_hints:
+        if folder_hint and candidate_album == folder_hint:
+            add(15, f"folder/album hint match {folder_hint!r}")
+            break
+
+    return score, reasons, strong_title_match and not strong_track_mismatch
+
+
+def score_fallback_repair_candidates(candidates: list[dict], hints: dict) -> list[dict]:
+    scored: list[dict] = []
+    for candidate in candidates:
+        score, reasons, safe_auto = score_repair_candidate(candidate, hints)
+        if score <= 0:
+            continue
+
+        enriched = dict(candidate)
+        enriched["_repair_score"] = score
+        enriched["_repair_reasons"] = reasons
+        enriched["_repair_safe_auto"] = safe_auto
+        scored.append(enriched)
+
+    scored.sort(key=lambda item: int(item.get("_repair_score") or 0), reverse=True)
+    log_info(f"Auto-repair fallback: {len(scored)} scored candidate(s).")
+    for index, candidate in enumerate(scored[:15], start=1):
+        log_info(
+            f"Auto-repair fallback score {index}: "
+            f"score={candidate.get('_repair_score')}, "
+            f"safe_auto={candidate.get('_repair_safe_auto')}, "
+            f"file={str(candidate.get('file') or '').strip()!r}, "
+            f"reasons={candidate.get('_repair_reasons')}"
+        )
+
+    return scored
+
+
+def get_fallback_repair_candidates(old_path: str) -> list[dict]:
+    hints = build_repair_hints(old_path)
+    log_info(
+        "Auto-repair fallback hints: "
+        f"titles={hints.get('possible_titles')}, "
+        f"artists={hints.get('possible_artists')}, "
+        f"albums={hints.get('possible_albums')}, "
+        f"year={hints.get('year')}, "
+        f"track={hints.get('track_number')}, "
+        f"terms={hints.get('search_terms')}"
+    )
+
+    candidates = collect_fallback_repair_candidates(hints)
+    return score_fallback_repair_candidates(candidates, hints)
+
+
 def get_repair_candidates_for_path(old_path: str) -> list[dict]:
     filename, _directory = split_full_path(old_path)
     if not filename:
         log_info(f"Auto-repair: no filename could be extracted from old path: {old_path!r}")
         return []
 
-    log_info(f"Auto-repair: searching Kodi library by filename: {filename!r}")
+    log_info(f"Auto-repair: primary lookup by exact filename: {filename!r}")
     candidates = query_library_songs_by_filename(filename)
     unique_candidates = get_unique_song_candidates(candidates)
     log_info(
-        f"Auto-repair: Kodi returned {len(candidates)} raw candidate(s), "
+        f"Auto-repair: primary lookup returned {len(candidates)} raw candidate(s), "
         f"{len(unique_candidates)} unique candidate(s) for {filename!r}."
     )
-    return unique_candidates
+
+    if unique_candidates:
+        log_info("Auto-repair: using primary filename candidate strategy.")
+        return unique_candidates
+
+    log_info("Auto-repair: primary lookup returned no candidates; starting fallback heuristics.")
+    return get_fallback_repair_candidates(old_path)
 
 
 def format_repair_candidate_label(song: dict) -> str:
@@ -1092,8 +2399,12 @@ def format_repair_candidate_label(song: dict) -> str:
     artist = first_non_empty_text(song.get("artist"))
     album = str(song.get("album") or "").strip()
     file_value = str(song.get("file") or "").strip()
+    score = int(song.get("_repair_score") or 0)
+    reasons = song.get("_repair_reasons") or []
 
     parts: list[str] = []
+    if score:
+        parts.append(str(score))
     if artist:
         parts.append(artist)
     if title:
@@ -1101,10 +2412,14 @@ def format_repair_candidate_label(song: dict) -> str:
     if album:
         parts.append(f"[{album}]")
 
-    if parts:
-        return " - ".join(parts) + f" · {file_value}"
+    label = " - ".join(parts) if parts else (file_value or "Unknown candidate")
+    if score and reasons:
+        label = f"{label} · {', '.join(str(reason) for reason in reasons[:3])}"
 
-    return file_value or "Unknown candidate"
+    if file_value:
+        return f"{label} · {file_value}"
+
+    return label
 
 
 def log_repair_candidates(old_path: str, candidates: list[dict]) -> None:
@@ -1127,17 +2442,42 @@ def choose_repair_candidate(old_path: str, candidates: list[dict]) -> str:
         log_info("Auto-repair: no repair candidates found.")
         return ""
 
-    matched = find_song_by_file_relaxed(candidates, old_path)
-    if matched is not None:
-        value = str(matched.get("file") or "").strip()
-        if value:
-            log_info(f"Auto-repair: relaxed lookup selected candidate automatically: {value!r}")
-            return value
+    scored_candidates = [candidate for candidate in candidates if int(candidate.get("_repair_score") or 0) > 0]
+    if scored_candidates:
+        sorted_candidates = sorted(scored_candidates, key=lambda item: int(item.get("_repair_score") or 0), reverse=True)
+        best = sorted_candidates[0]
+        best_score = int(best.get("_repair_score") or 0)
+        second_score = int(sorted_candidates[1].get("_repair_score") or 0) if len(sorted_candidates) > 1 else 0
+        score_gap = best_score - second_score
 
-    if len(candidates) == 1:
-        value = str(candidates[0].get("file") or "").strip()
-        log_info(f"Auto-repair: single candidate selected automatically: {value!r}")
-        return value
+        best_safe_auto = bool(best.get("_repair_safe_auto"))
+        if best_safe_auto and best_score >= 120 and score_gap >= 35:
+            value = str(best.get("file") or "").strip()
+            if value:
+                log_info(
+                    f"Auto-repair fallback: high-confidence candidate selected automatically: "
+                    f"score={best_score}, gap={score_gap}, safe_auto={best_safe_auto}, file={value!r}"
+                )
+                return value
+
+        log_info(
+            f"Auto-repair fallback: no high-confidence automatic match. "
+            f"best_score={best_score}, second_score={second_score}, gap={score_gap}, "
+            f"safe_auto={best_safe_auto}."
+        )
+        candidates = sorted_candidates[:25]
+    else:
+        matched = find_song_by_file_relaxed(candidates, old_path)
+        if matched is not None:
+            value = str(matched.get("file") or "").strip()
+            if value:
+                log_info(f"Auto-repair: relaxed lookup selected candidate automatically: {value!r}")
+                return value
+
+        if len(candidates) == 1:
+            value = str(candidates[0].get("file") or "").strip()
+            log_info(f"Auto-repair: single candidate selected automatically: {value!r}")
+            return value
 
     log_info("Auto-repair: ambiguous candidates found, showing manual selection dialog.")
     labels = ["Skip this track"] + [format_repair_candidate_label(song) for song in candidates]
@@ -1157,6 +2497,103 @@ def choose_repair_candidate(old_path: str, candidates: list[dict]) -> str:
     value = str(candidates[selected - 1].get("file") or "").strip()
     log_info(f"Auto-repair: user selected repair candidate: {value!r}")
     return value
+
+
+def choose_repair_candidate_automatic_only(old_path: str, candidates: list[dict]) -> str:
+    log_repair_candidates(old_path, candidates)
+
+    if not candidates:
+        log_info("Auto-repair service: no repair candidates found.")
+        return ""
+
+    scored_candidates = [candidate for candidate in candidates if int(candidate.get("_repair_score") or 0) > 0]
+    if scored_candidates:
+        sorted_candidates = sorted(scored_candidates, key=lambda item: int(item.get("_repair_score") or 0), reverse=True)
+        best = sorted_candidates[0]
+        best_score = int(best.get("_repair_score") or 0)
+        second_score = int(sorted_candidates[1].get("_repair_score") or 0) if len(sorted_candidates) > 1 else 0
+        score_gap = best_score - second_score
+        best_safe_auto = bool(best.get("_repair_safe_auto"))
+
+        high_confidence_candidates = [
+            candidate
+            for candidate in sorted_candidates
+            if bool(candidate.get("_repair_safe_auto"))
+            and int(candidate.get("_repair_score") or 0) >= 120
+        ]
+
+        if len(high_confidence_candidates) == 1 and best_safe_auto and best_score >= 120 and score_gap >= 35:
+            value = str(best.get("file") or "").strip()
+            if value:
+                log_info(
+                    f"Auto-repair service: high-confidence fallback candidate selected: "
+                    f"score={best_score}, gap={score_gap}, file={value!r}"
+                )
+                return value
+
+        log_info(
+            f"Auto-repair service: no safe automatic fallback match. "
+            f"best_score={best_score}, second_score={second_score}, gap={score_gap}, "
+            f"safe_auto={best_safe_auto}, high_confidence_count={len(high_confidence_candidates)}."
+        )
+        return ""
+
+    matched = find_song_by_file_relaxed(candidates, old_path)
+    if matched is not None:
+        value = str(matched.get("file") or "").strip()
+        if value:
+            log_info(f"Auto-repair service: relaxed lookup selected candidate: {value!r}")
+            return value
+
+    if len(candidates) == 1:
+        value = str(candidates[0].get("file") or "").strip()
+        log_info(f"Auto-repair service: single primary candidate selected: {value!r}")
+        return value
+
+    log_info(f"Auto-repair service: {len(candidates)} unscored candidates found; manual repair required.")
+    return ""
+
+
+def repair_saved_mix_automatic_only(cache_path: str) -> int:
+    log_info(f"Auto-repair service: started for saved mix: {cache_path!r}")
+
+    tracks = load_mix_by_cache_path(cache_path)
+    if not tracks:
+        log_info("Auto-repair service: stored mix is empty.")
+        return 0
+
+    repaired = 0
+    missing = 0
+    updated_tracks: list[str] = []
+
+    for index, track in enumerate(tracks):
+        if track_file_exists(track):
+            updated_tracks.append(track)
+            continue
+
+        missing += 1
+        log_info(f"Auto-repair service: track {index} is missing: {track!r}")
+
+        candidates = get_repair_candidates_for_path(track)
+        replacement = choose_repair_candidate_automatic_only(track, candidates)
+
+        if replacement:
+            log_info(f"Auto-repair service: replacing {track!r} with {replacement!r}")
+            updated_tracks.append(replacement)
+            repaired += 1
+        else:
+            log_info(f"Auto-repair service: no safe automatic replacement for {track!r}")
+            updated_tracks.append(track)
+
+    log_info(f"Auto-repair service: completed candidate handling. Missing={missing}, repaired={repaired}.")
+
+    if repaired <= 0:
+        return 0
+
+    save_mix_by_cache_path(cache_path, updated_tracks)
+    analyze_mix_consistency(cache_path)
+    log_info(f"Auto-repair service: saved repaired mix. Repaired={repaired}.")
+    return repaired
 
 
 def repair_saved_mix_foreground(cache_path: str) -> int:
@@ -1211,7 +2648,7 @@ def query_library_songs_by_filename(filename: str) -> list[dict]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'thumbnail', 'fanart'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'track', 'thumbnail', 'fanart'],
                 'filter': {'field': 'filename', 'operator': 'is', 'value': filename},
             },
         )
@@ -1244,7 +2681,7 @@ def query_library_songs_strict(filename: str, directory: str) -> list[dict]:
         result = execute_jsonrpc(
             'AudioLibrary.GetSongs',
             {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'thumbnail', 'fanart'],
+                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'track', 'thumbnail', 'fanart'],
                 'filter': {'and': filters},
             },
         )
@@ -1279,6 +2716,26 @@ def parse_year(value: object) -> int:
         return 0
 
     return year
+
+
+def parse_track_number(value: object) -> int:
+    if isinstance(value, list):
+        value = value[0] if value else 0
+
+    text = str(value or "").strip()
+    if not text:
+        return 0
+
+    try:
+        return max(0, int(text))
+    except (TypeError, ValueError):
+        match = re.match(r"^\s*(\d{1,3})", text)
+        if not match:
+            return 0
+        try:
+            return max(0, int(match.group(1)))
+        except (TypeError, ValueError):
+            return 0
 
 
 def normalize_genres(value: object) -> list[str]:
@@ -1399,6 +2856,101 @@ def get_track_metadata(path: str) -> dict[str, str]:
     metadata['duration'] = parse_duration_seconds(metadata.get('duration'))
     return metadata
 
+KODI_MUSIC_TRACK_TEMPLATE_CACHE = None
+KODI_MUSIC_TRACK_TEMPLATE_FALLBACK = "[%N. ]%A - %T"
+KODI_MUSIC_TRACK_TEMPLATE_SETTING_CANDIDATES = [
+    "musicfiles.trackformat",
+    "musiclibrary.trackformat",
+    "musicplayer.trackformat",
+    "musicfiles.librarytrackformat",
+]
+
+
+def get_kodi_setting_value_safe(setting_id: str):
+    try:
+        return execute_jsonrpc("Settings.GetSettingValue", {"setting": setting_id}).get("value")
+    except Exception as exc:
+        log(f"Could not read Kodi setting {setting_id!r}: {exc}", xbmc.LOGDEBUG)
+        return None
+
+
+def get_kodi_music_track_template() -> str:
+    global KODI_MUSIC_TRACK_TEMPLATE_CACHE
+
+    if KODI_MUSIC_TRACK_TEMPLATE_CACHE:
+        return KODI_MUSIC_TRACK_TEMPLATE_CACHE
+
+    for setting_id in KODI_MUSIC_TRACK_TEMPLATE_SETTING_CANDIDATES:
+        value = get_kodi_setting_value_safe(setting_id)
+        if isinstance(value, str) and "%" in value:
+            KODI_MUSIC_TRACK_TEMPLATE_CACHE = value
+            log(f"Using Kodi music track template from {setting_id!r}: {value!r}", xbmc.LOGINFO)
+            return value
+
+    KODI_MUSIC_TRACK_TEMPLATE_CACHE = KODI_MUSIC_TRACK_TEMPLATE_FALLBACK
+    log(
+        f"Using fallback Kodi music track template: {KODI_MUSIC_TRACK_TEMPLATE_FALLBACK!r}",
+        xbmc.LOGINFO,
+    )
+    return KODI_MUSIC_TRACK_TEMPLATE_CACHE
+
+
+def format_template_optional_blocks(template: str, values: dict[str, str]) -> str:
+    def replace_optional(match):
+        content = match.group(1)
+
+        tokens = re.findall(r"%[A-Za-z]", content)
+        for token in tokens:
+            if not str(values.get(token, "")).strip():
+                return ""
+
+        result = content
+        for token, value in values.items():
+            result = result.replace(token, str(value or ""))
+
+        return result
+
+    return re.sub(r"\[([^\[\]]*)\]", replace_optional, template)
+
+
+def cleanup_music_label(label: str, fallback: str) -> str:
+    value = re.sub(r"\s+", " ", str(label or "")).strip()
+    value = re.sub(r"^\s*[-–—:|]+\s*", "", value)
+    value = re.sub(r"\s*[-–—:|]+\s*$", "", value)
+    value = value.strip()
+    return value or fallback
+
+
+def format_mix_track_label(path: str, metadata: dict, mix_position: int) -> str:
+    title = str(metadata.get("title") or path_to_label(path) or "").strip()
+    artist = str(metadata.get("artist") or "").strip()
+    album = str(metadata.get("album") or "").strip()
+
+    try:
+        number = str(int(mix_position)) if int(mix_position) > 0 else ""
+    except Exception:
+        number = ""
+
+    fallback = title or path_to_label(path)
+    template = get_kodi_music_track_template()
+
+    values = {
+        "%N": number,
+        "%A": artist,
+        "%T": title,
+        "%B": album,
+        "%L": album,
+    }
+
+    label = format_template_optional_blocks(template, values)
+    for token, value in values.items():
+        label = label.replace(token, str(value or ""))
+
+    # Remove unknown template tokens only if they are isolated leftovers.
+    label = re.sub(r"%[A-Za-z]", "", label)
+    return cleanup_music_label(label, fallback)
+
+
 def apply_music_metadata(
     list_item: xbmcgui.ListItem,
     title: str,
@@ -1407,6 +2959,7 @@ def apply_music_metadata(
     year: int = 0,
     duration: int = 0,
     genres: object = None,
+    track_number: int = 0,
 ) -> None:
     try:
         music_tag = list_item.getMusicInfoTag()
@@ -1415,6 +2968,13 @@ def apply_music_metadata(
             music_tag.setArtist(artist)
         if album:
             music_tag.setAlbum(album)
+
+        try:
+            parsed_track = int(track_number or 0)
+            if parsed_track > 0:
+                music_tag.setTrack(parsed_track)
+        except Exception:
+            pass
 
         genre_values = normalize_genres(genres)
         if genre_values:
@@ -1526,13 +3086,26 @@ def apply_track_detail_display(
         pass
 
 
+def add_error_item(label: str) -> None:
+    item = xbmcgui.ListItem(label=label, offscreen=True)
+    try:
+        apply_music_metadata(item, label)
+    except Exception:
+        pass
+    xbmcplugin.addDirectoryItem(HANDLE, "", item, isFolder=False)
+
+
 def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str = '') -> None:
     metadata = get_track_metadata(path)
-    label = metadata['title'] or path_to_label(path)
+    mix_position = int(index) + 1
+    title = metadata.get('title') or path_to_label(path)
+    label = format_mix_track_label(path, metadata, mix_position)
     missing = is_track_missing(path)
     display_label = problem_marker_label(label) if missing else label
     list_item = xbmcgui.ListItem(label=display_label, offscreen=True)
     list_item.setProperty("IsPlayable", "true")
+    list_item.setProperty("MusicIP.OriginalTitle", str(title or ""))
+    list_item.setProperty("MusicIP.DisplayTitle", str(display_label or ""))
     if missing:
         list_item.setProperty("MusicIP.Missing", "true")
     apply_music_metadata(
@@ -1543,6 +3116,7 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
         year=parse_year(metadata.get('year')),
         duration=parse_duration_seconds(metadata.get('duration')),
         genres=metadata.get('genre'),
+        track_number=mix_position,
     )
     apply_music_extra_properties(
         list_item,
@@ -1641,15 +3215,23 @@ def add_saved_mix_item(cache_path: str) -> None:
     display_label = problem_marker_label(label) if inconsistent else label
     list_item = xbmcgui.ListItem(label=display_label, offscreen=True)
     apply_music_metadata(list_item, display_label)
+    apply_saved_mix_info_metadata(list_item, cache_path)
     list_item.setProperty("IsPlayable", "false")
     if inconsistent:
         list_item.setProperty("MusicIP.Inconsistent", "true")
 
     context_items = [
+        ("Information", f"RunPlugin({addon_url(action='mix_info', cache_path=cache_path, nonce=new_nonce())})"),
+        ("Show mix information", f"RunPlugin({addon_url(action='mix_info', cache_path=cache_path, nonce=new_nonce())})"),
         ("Check consistency", build_check_mix_action(cache_path)),
     ]
+    repair_readiness = {}
     if inconsistent:
-        context_items.append(("Auto-repair this mix", build_repair_mix_action(cache_path)))
+        repair_readiness = get_or_update_mix_repair_readiness(cache_path, tracks, meta)
+        if is_repair_ready(repair_readiness):
+            context_items.append(("Auto-repair this mix", build_repair_mix_action(cache_path)))
+        else:
+            context_items.append(("Update library before repair", build_update_library_before_repair_action(cache_path)))
     context_items.append(("Cleanup this mix", build_cleanup_saved_mix_action(cache_path)))
     list_item.addContextMenuItems(context_items)
 
@@ -1659,6 +3241,8 @@ def add_saved_mix_item(cache_path: str) -> None:
         detail_parts.append(time.strftime("%Y-%m-%d %H:%M", time.localtime(updated_ts)))
     if consistency_label and consistency_label != "OK":
         detail_parts.append(consistency_label)
+    if inconsistent and repair_readiness and not is_repair_ready(repair_readiness):
+        detail_parts.append("Update library before repair")
     if detail_parts:
         list_item.setLabel2(" · ".join(detail_parts))
 
@@ -1684,6 +3268,15 @@ def show_root() -> None:
         isFolder=True,
     )
 
+    discovery_item = xbmcgui.ListItem(label="Discovery mode", offscreen=True)
+    apply_music_metadata(discovery_item, "Discovery mode")
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        addon_url(action="discovery_mode"),
+        discovery_item,
+        isFolder=True,
+    )
+
     recent_item = xbmcgui.ListItem(label="Recent mixes", offscreen=True)
     apply_music_metadata(recent_item, "Recent mixes")
     xbmcplugin.addDirectoryItem(
@@ -1695,15 +3288,365 @@ def show_root() -> None:
 
     settings_item = xbmcgui.ListItem(label="Settings", offscreen=True)
     apply_music_metadata(settings_item, "Settings")
+    settings_item.setProperty("IsPlayable", "false")
     xbmcplugin.addDirectoryItem(
         HANDLE,
-        addon_url(action="open_settings"),
+        addon_url(action="open_settings", nonce=new_nonce()),
         settings_item,
         isFolder=True,
     )
 
     xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
+
+def add_discovery_run_action_item(label: str, action: str) -> None:
+    item = xbmcgui.ListItem(label=label, offscreen=True)
+    apply_music_metadata(item, label)
+    item.setProperty("IsPlayable", "false")
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        run_plugin_url(action=action, nonce=new_nonce()),
+        item,
+        isFolder=False,
+    )
+
+
+def add_discovery_action_item(label: str, action: str, is_folder: bool = True) -> None:
+    item = xbmcgui.ListItem(label=label, offscreen=True)
+    apply_music_metadata(item, label)
+    xbmcplugin.addDirectoryItem(
+        HANDLE,
+        addon_url(action=action, nonce=new_nonce()),
+        item,
+        isFolder=is_folder,
+    )
+
+
+def show_discovery_mode_menu() -> None:
+    state = get_discovery_state()
+    active = bool(state.get("enabled"))
+
+    title = "MusicIP discovery mode"
+    if active:
+        current = str(state.get("current_label") or state.get("current_song") or "").strip()
+        if current:
+            title = f"Discovery mode: {current}"
+        else:
+            title = "Discovery mode: active"
+
+    xbmcplugin.setPluginCategory(HANDLE, title)
+    xbmcplugin.setContent(HANDLE, "files")
+
+    if active:
+        add_discovery_action_item("Create mix from current discovery song", "discovery_mix_current", is_folder=True)
+        add_discovery_action_item("Skip to next discovery song", "discovery_next", is_folder=True)
+        add_discovery_action_item("Stop discovery mode", "discovery_stop", is_folder=True)
+    else:
+        add_discovery_action_item("Start discovery mode", "discovery_start", is_folder=True)
+
+    add_discovery_action_item("Discovery mode settings", "open_settings", is_folder=True)
+
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
+
+
+def start_discovery_mode() -> None:
+    state = get_discovery_state()
+    state.update({
+        "enabled": False,
+        "startup_in_progress": True,
+        "started_ts": int(time.time()),
+        "stopped_ts": 0,
+        "excerpt_seconds": get_discovery_excerpt_seconds(),
+        "offset_percent": get_discovery_offset_percent(),
+        "stop_reason": "",
+        "resume_allowed": True,
+        "current_started_ts": 0,
+        "current_song": "",
+        "current_label": "",
+        "current_playlist_position": -1,
+        "queue": [],
+        "last_error": "",
+    })
+    save_discovery_state(state)
+
+    state = start_discovery_playlist_direct(state)
+
+    log(
+        f"Discovery mode: UI completed direct playlist start. "
+        f"state_path={discovery_state_path()}, command_path={discovery_command_path()}",
+        xbmc.LOGINFO,
+    )
+    notify("Discovery mode started.")
+    replace_with_discovery_mode_menu()
+
+def stop_discovery_mode() -> None:
+    state = get_discovery_state()
+    state["enabled"] = False
+    state["stopped_ts"] = int(time.time())
+    state["stop_reason"] = "manual_stop"
+    state["resume_allowed"] = False
+    state["startup_in_progress"] = False
+    state["next_requested"] = False
+    state["next_reason"] = ""
+    save_discovery_state(state)
+    try:
+        xbmc.Player().stop()
+    except Exception:
+        pass
+
+    try:
+        get_music_playlist().clear()
+    except Exception:
+        pass
+
+    notify("Discovery mode stopped.")
+    replace_with_discovery_mode_menu()
+
+def get_current_music_playlist_position(default: int = -1) -> int:
+    try:
+        result = execute_jsonrpc("Player.GetProperties", {"playerid": 0, "properties": ["position"]})
+        return int(result.get("position"))
+    except Exception:
+        return default
+
+
+def set_discovery_mix_dialog_hold(seed: str) -> dict:
+    state = get_discovery_state()
+    now = int(time.time())
+    excerpt_seconds = int(state.get("excerpt_seconds") or get_discovery_excerpt_seconds())
+    state.update({
+        "mix_dialog_active": True,
+        "mix_dialog_seed": seed,
+        "mix_dialog_started_ts": now,
+        "mix_dialog_excerpt_seconds": excerpt_seconds,
+        "next_requested": False,
+        "next_reason": "",
+        "pending_player_stop": False,
+        "pending_player_stop_reason": "",
+    })
+    save_discovery_state(state)
+    log(
+        f"Discovery mode: mix dialog hold started for seed={seed!r}, "
+        f"excerpt_seconds={excerpt_seconds}.",
+        xbmc.LOGINFO,
+    )
+    return state
+
+
+def clear_discovery_mix_dialog_hold(skip_if_elapsed: bool = False) -> None:
+    state = get_discovery_state()
+    now = int(time.time())
+
+    try:
+        started_ts = int(state.get("mix_dialog_started_ts") or 0)
+    except Exception:
+        started_ts = 0
+
+    try:
+        excerpt_seconds = int(
+            state.get("mix_dialog_excerpt_seconds")
+            or state.get("excerpt_seconds")
+            or get_discovery_excerpt_seconds()
+        )
+    except Exception:
+        excerpt_seconds = get_discovery_excerpt_seconds()
+
+    elapsed = max(0, now - started_ts) if started_ts > 0 else 0
+
+    state["mix_dialog_active"] = False
+    state["mix_dialog_seed"] = ""
+    state["mix_dialog_started_ts"] = 0
+    state["mix_dialog_excerpt_seconds"] = 0
+    state["next_requested"] = False
+    state["next_reason"] = ""
+    state["pending_player_stop"] = False
+    state["pending_player_stop_reason"] = ""
+
+    if not state.get("enabled"):
+        save_discovery_state(state)
+        return
+
+    if skip_if_elapsed and elapsed >= excerpt_seconds:
+        position = get_current_music_playlist_position(state.get("current_playlist_position", -1))
+        if position < 0:
+            try:
+                position = int(state.get("current_playlist_position") or 0)
+            except Exception:
+                position = 0
+
+        target_pos = position + 1
+        queue = state.get("queue")
+        if isinstance(queue, list) and target_pos < len(queue):
+            try:
+                execute_jsonrpc("Player.GoTo", {"playerid": 0, "to": target_pos})
+                log(
+                    f"Discovery mode: mix dialog was open {elapsed}s >= {excerpt_seconds}s; "
+                    f"skipping directly to playlist position {target_pos}.",
+                    xbmc.LOGINFO,
+                )
+                update_discovery_state_for_playlist_position(state, target_pos)
+                return
+            except Exception as exc:
+                log(f"Discovery mode: mix dialog cancel skip failed: {exc}", xbmc.LOGWARNING)
+
+    # Dialog was shorter than the excerpt length, or direct skip failed:
+    # keep current_started_ts unchanged so the Discovery timer continues as if
+    # the dialog had never been opened.
+    save_discovery_state(state)
+    log(
+        f"Discovery mode: mix dialog hold cleared after {elapsed}s; "
+        f"continuing existing excerpt timer.",
+        xbmc.LOGINFO,
+    )
+
+
+
+def update_discovery_state_for_playlist_position(state: dict, position: int) -> dict:
+    queue = state.get("queue")
+    if not isinstance(queue, list):
+        return state
+
+    try:
+        position = int(position)
+    except Exception:
+        return state
+
+    if position < 0 or position >= len(queue):
+        return state
+
+    entry = queue[position]
+    file_path = str(entry.get("file") or "")
+    if not file_path:
+        return state
+
+    now = int(time.time())
+    state.update({
+        "enabled": True,
+        "startup_in_progress": False,
+        "current_playlist_position": position,
+        "current_song": file_path,
+        "current_label": str(entry.get("label") or path_to_label(file_path)),
+        "current_started_ts": now,
+        "current_offset_seconds": int(entry.get("offset") or 0),
+        "current_duration_seconds": int(entry.get("duration") or 0),
+        "current_startoffset_requested": bool(int(entry.get("offset") or 0) > 0),
+        "current_seek_confirmed": False,
+        "next_requested": False,
+        "next_reason": "",
+        "pending_player_stop": False,
+        "pending_player_stop_reason": "",
+        "playlist_change_pending": False,
+        "mix_dialog_active": False,
+        "mix_dialog_seed": "",
+        "mix_dialog_started_ts": 0,
+        "mix_dialog_excerpt_seconds": 0,
+        "last_ui_next_ts": now,
+        "last_error": "",
+    })
+    save_discovery_state(state)
+    log(
+        f"Discovery mode: UI updated state for playlist position {position}, "
+        f"label={state.get('current_label')!r}.",
+        xbmc.LOGINFO,
+    )
+    return state
+
+
+def discovery_next_track() -> None:
+    try:
+        state = get_discovery_state()
+        raw_pos = state.get("current_playlist_position")
+        pos = int(raw_pos) if raw_pos is not None else 0
+        target_pos = pos + 1
+
+        queue = state.get("queue")
+        if isinstance(queue, list) and target_pos >= len(queue):
+            notify("No buffered next discovery song available yet.", xbmcgui.NOTIFICATION_WARNING)
+            replace_with_discovery_mode_menu()
+            return
+
+        execute_jsonrpc("Player.GoTo", {"playerid": 0, "to": target_pos})
+        log(f"Discovery mode: UI requested direct Player.GoTo({target_pos}).", xbmc.LOGINFO)
+        update_discovery_state_for_playlist_position(state, target_pos)
+
+    except Exception as exc:
+        log(f"Discovery mode: UI direct next failed: {exc}", xbmc.LOGWARNING)
+
+    notify("Discovery mode: skipping to next song.")
+    replace_with_discovery_mode_menu()
+
+def discovery_mix_from_current() -> None:
+    state = get_discovery_state()
+    seed = str(state.get("current_song") or "").strip()
+
+    if not seed:
+        try:
+            seed = get_current_seed_song()
+        except Exception:
+            seed = ""
+
+    if not seed:
+        notify("No discovery song is currently available.", xbmcgui.NOTIFICATION_WARNING)
+        replace_with_discovery_mode_menu()
+        return
+
+    # Capture the seed immediately, then put the Discovery service into a
+    # temporary hold. Playback continues, but excerpt-based auto-skip is paused.
+    set_discovery_mix_dialog_hold(seed)
+    size = get_playlist_size()
+
+    try:
+        tracks = fetch_mix_confirmed(seed, size)
+    except MusicIPError as exc:
+        notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
+        log(str(exc), xbmc.LOGERROR)
+        clear_discovery_mix_dialog_hold(skip_if_elapsed=True)
+        replace_with_discovery_mode_menu()
+        return
+    except Exception as exc:
+        notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+        log(f"Discovery mix generation failed: {exc}", xbmc.LOGERROR)
+        clear_discovery_mix_dialog_hold(skip_if_elapsed=True)
+        replace_with_discovery_mode_menu()
+        return
+
+    stop_state = get_discovery_state()
+    stop_state["enabled"] = False
+    stop_state["stopped_ts"] = int(time.time())
+    stop_state["stop_reason"] = "mix_from_discovery_song"
+    stop_state["resume_allowed"] = False
+    stop_state["startup_in_progress"] = False
+    stop_state["mix_dialog_active"] = False
+    stop_state["mix_dialog_seed"] = ""
+    stop_state["mix_dialog_started_ts"] = 0
+    stop_state["mix_dialog_excerpt_seconds"] = 0
+    save_discovery_state(stop_state)
+
+    try:
+        xbmc.Player().stop()
+    except Exception:
+        pass
+
+    try:
+        get_music_playlist().clear()
+    except Exception:
+        pass
+
+    try:
+        save_mix(seed, size, tracks)
+        play_tracks_as_music_playlist(tracks)
+    except Exception as exc:
+        notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+        log(f"Discovery mix playback failed: {exc}", xbmc.LOGERROR)
+        replace_with_discovery_mode_menu()
+        return
+
+    notify("Discovery mode stopped. Playing generated mix.")
+    try:
+        xbmc.executebuiltin(f"Container.Update({build_browse_url(seed, size)},replace)")
+    except Exception as exc:
+        log(f"Discovery mode: could not replace container with generated mix: {exc}", xbmc.LOGWARNING)
+        replace_with_discovery_mode_menu()
 
 def show_saved_mixes() -> None:
     xbmcplugin.setPluginCategory(HANDLE, "MusicIP recent mixes")
@@ -1750,16 +3693,48 @@ def show_saved_mixes_by_date(date_key: str) -> None:
     xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
 def generate_current_mix() -> None:
-    try:
-        seed = get_current_seed_song()
-    except MusicIPError as exc:
-        notify(str(exc), xbmcgui.NOTIFICATION_WARNING)
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False, cacheToDisc=False)
+    seed = get_current_seed_song()
+    if not seed:
+        notify("No playing song found.", xbmcgui.NOTIFICATION_WARNING)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=True, cacheToDisc=False)
         return
 
     size = get_playlist_size()
-    browse_mix(seed, size, force_refresh=False, update_listing=False)
 
+    try:
+        tracks = fetch_mix_confirmed(seed, size)
+    except MusicIPError as exc:
+        message = str(exc)
+        notify(message, xbmcgui.NOTIFICATION_WARNING if "cancelled" in message.lower() else xbmcgui.NOTIFICATION_ERROR)
+        log(message, xbmc.LOGERROR)
+        add_error_item(f"MusicIP mix failed: {message}")
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=True, cacheToDisc=False)
+        return
+    except Exception as exc:
+        message = str(exc)
+        notify(message, xbmcgui.NOTIFICATION_ERROR)
+        log(f"Generate mix from playing audio failed: {message}", xbmc.LOGERROR)
+        add_error_item(f"MusicIP mix failed: {message}")
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=True, cacheToDisc=False)
+        return
+
+    try:
+        save_mix(seed, size, tracks)
+        play_tracks_as_music_playlist(tracks)
+    except Exception as exc:
+        message = str(exc)
+        notify(message, xbmcgui.NOTIFICATION_ERROR)
+        log(f"Generate mix playback failed: {message}", xbmc.LOGERROR)
+        add_error_item(f"MusicIP mix playback failed: {message}")
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=True, cacheToDisc=False)
+        return
+
+    notify("Playing generated mix.")
+    try:
+        xbmc.executebuiltin(f"Container.Update({build_browse_url(seed, size)},replace)")
+    except Exception as exc:
+        log(f"Generate mix: could not replace container with generated mix: {exc}", xbmc.LOGWARNING)
+        browse_mix(seed, size, force_refresh=False, update_listing=False)
 
 def browse_mix(
     seed: str,
@@ -1775,19 +3750,21 @@ def browse_mix(
 
     try:
         if force_refresh:
-            tracks = fetch_mix(seed, size)
+            tracks = fetch_mix_confirmed(seed, size)
             save_mix(seed, size, tracks)
         else:
             try:
                 tracks = load_mix(seed, size)
                 log("Loaded stored mix from cache.")
             except MusicIPError:
-                tracks = fetch_mix(seed, size)
+                tracks = fetch_mix_confirmed(seed, size)
                 save_mix(seed, size, tracks)
     except MusicIPError as exc:
-        notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
-        log(str(exc), xbmc.LOGERROR)
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False, updateListing=update_listing, cacheToDisc=False)
+        message = str(exc)
+        notify(message, xbmcgui.NOTIFICATION_WARNING if "cancelled" in message.lower() else xbmcgui.NOTIFICATION_ERROR)
+        log(message, xbmc.LOGERROR)
+        add_error_item(f"MusicIP mix failed: {message}")
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=True, updateListing=update_listing, cacheToDisc=False)
         return
 
     if not tracks:
@@ -1817,7 +3794,7 @@ def browse_saved_mix(
         seed = (meta.get("seed") or (tracks[0] if tracks else "")).strip()
         size = int(meta.get("size") or len(tracks) or get_playlist_size())
     except MusicIPError as exc:
-        notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+        notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
         log(str(exc), xbmc.LOGERROR)
         xbmcplugin.endOfDirectory(HANDLE, succeeded=False, updateListing=update_listing, cacheToDisc=False)
         return
@@ -1832,11 +3809,11 @@ def browse_saved_mix(
             xbmcplugin.endOfDirectory(HANDLE, succeeded=False, updateListing=update_listing, cacheToDisc=False)
             return
         try:
-            tracks = fetch_mix(seed, size)
+            tracks = fetch_mix_confirmed(seed, size)
             save_mix(seed, size, tracks)
             cache_path = mix_cache_path(seed, size)
         except MusicIPError as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             xbmcplugin.endOfDirectory(HANDLE, succeeded=False, updateListing=update_listing, cacheToDisc=False)
             return
@@ -1852,6 +3829,186 @@ def browse_saved_mix(
 
     xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing, cacheToDisc=False)
     apply_pending_focus(focus_index, focus_token)
+
+
+def format_sidecar_ts(value: object) -> str:
+    try:
+        ts = int(value or 0)
+    except Exception:
+        ts = 0
+
+    if ts <= 0:
+        return "unknown"
+
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(ts)
+
+
+def build_mix_info_message(cache_path: str) -> str:
+    tracks = load_mix_by_cache_path(cache_path)
+    meta = get_saved_mix_metadata(cache_path, tracks)
+
+    params = meta.get("mix_generation_parameters")
+    if not isinstance(params, dict):
+        params = {}
+
+    consistency = meta.get("consistency")
+    if not isinstance(consistency, dict):
+        consistency = {}
+
+    readiness = meta.get("repair_readiness")
+    if not isinstance(readiness, dict):
+        readiness = {}
+
+    lines = [
+        f"Label: {meta.get('label') or path_to_label(meta.get('seed') or cache_path)}",
+        f"Seed: {meta.get('seed') or 'unknown'}",
+        f"Tracks: {meta.get('track_count') or len(tracks)}",
+        f"Saved: {format_sidecar_ts(meta.get('updated_ts'))}",
+        f"Modified: {format_sidecar_ts(meta.get('modified_ts'))}",
+        "",
+        "Mix generation parameters:",
+    ]
+
+    if params:
+        reject_size = int(params.get("rejectsize") or 0)
+        reject_text = (
+            f"do not repeat artist within {reject_size} tracks"
+            if reject_size > 0
+            else "disabled"
+        )
+        lines.extend([
+            f"Size: {params.get('size', 'unknown')} {params.get('sizetype', 'tracks')}",
+            f"Style: {params.get('style_ui', 'unknown')}/10 - {params.get('style_label', '')} (API {params.get('style', 'unknown')})",
+            f"Variety: {params.get('variety', 'unknown')}",
+            f"Restrict to seed genre: {'yes' if params.get('mixgenre') else 'no'}",
+            f"Filter: {params.get('filter') or '<none>'}",
+            f"Artist repeat: {reject_text}",
+            f"Recorded: {format_sidecar_ts(meta.get('mix_generation_parameters_ts'))}",
+        ])
+    else:
+        lines.append("No generation parameters recorded for this mix.")
+
+    lines.extend([
+        "",
+        "Consistency:",
+        f"Status: {consistency.get('status') or 'unknown'}",
+        f"Missing files: {consistency.get('missing_files', 0)}",
+        f"Checked: {format_sidecar_ts(consistency.get('checked_ts'))}",
+    ])
+
+    if readiness:
+        lines.extend([
+            "",
+            "Repair readiness:",
+            f"Status: {readiness.get('status') or 'unknown'}",
+            f"Reason: {readiness.get('reason') or ''}",
+            f"Required library timestamp: {format_sidecar_ts(readiness.get('required_library_ts'))}",
+            f"Latest library timestamp: {format_sidecar_ts(readiness.get('library_freshest_ts'))}",
+        ])
+
+    return "\n".join(lines)
+
+
+def show_mix_info(cache_path: str) -> None:
+    try:
+        message = build_mix_info_message(cache_path)
+    except Exception as exc:
+        xbmcgui.Dialog().ok("MusicIP mix information", f"Could not read mix information.\n\n{exc}")
+        return
+
+    try:
+        xbmcgui.Dialog().textviewer("MusicIP mix information", message)
+    except Exception:
+        xbmcgui.Dialog().ok("MusicIP mix information", message)
+
+
+def selected_mix_cache_path() -> str:
+    labels = [
+        "ListItem.Property(MusicIP.CachePath)",
+        "Container.ListItem.Property(MusicIP.CachePath)",
+        "ListItem.Property(cache_path)",
+        "Container.ListItem.Property(cache_path)",
+    ]
+    for label in labels:
+        try:
+            value = xbmc.getInfoLabel(label)
+        except Exception:
+            value = ""
+        if value:
+            return value.strip()
+    return ""
+
+
+def show_selected_mix_info() -> None:
+    cache_path = selected_mix_cache_path()
+    if not cache_path:
+        notify("No saved mix is selected.", xbmcgui.NOTIFICATION_WARNING)
+        return
+    show_mix_info(cache_path)
+
+
+def apply_saved_mix_info_metadata(list_item: xbmcgui.ListItem, cache_path: str) -> None:
+    try:
+        list_item.setProperty("MusicIP.CachePath", cache_path)
+        list_item.setProperty("cache_path", cache_path)
+        list_item.setProperty("InfoAction", addon_url(action="mix_info", cache_path=cache_path, nonce=new_nonce()))
+        list_item.setProperty("MusicIP.InfoAction", addon_url(action="mix_info", cache_path=cache_path, nonce=new_nonce()))
+    except Exception:
+        pass
+
+    try:
+        message = build_mix_info_message(cache_path)
+        list_item.setProperty("Plot", message)
+        list_item.setProperty("plot", message)
+        list_item.setProperty("Description", message)
+    except Exception:
+        message = ""
+
+    try:
+        tag = list_item.getMusicInfoTag()
+        if hasattr(tag, "setComment") and message:
+            tag.setComment(message)
+    except Exception:
+        pass
+
+
+def play_tracks_as_music_playlist(tracks: list[str]) -> None:
+    playable_tracks = [track for track in tracks if str(track or "").strip()]
+    if not playable_tracks:
+        raise MusicIPError("The generated mix contains no playable tracks.")
+
+    playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
+    playlist.clear()
+
+    for index, track in enumerate(playable_tracks):
+        mix_position = index + 1
+        metadata = get_track_metadata(track)
+        title = metadata.get("title") or path_to_label(track)
+        label = format_mix_track_label(track, metadata, mix_position)
+        list_item = xbmcgui.ListItem(label=label, offscreen=True)
+        list_item.setProperty("MusicIP.OriginalTitle", str(title or ""))
+        list_item.setProperty("MusicIP.DisplayTitle", str(label or ""))
+        try:
+            apply_music_metadata(
+                list_item,
+                label,
+                artist=metadata.get("artist", ""),
+                album=metadata.get("album", ""),
+                year=parse_year(metadata.get("year")),
+                duration=parse_duration_seconds(metadata.get("duration")),
+                genres=metadata.get("genre"),
+                track_number=mix_position,
+            )
+        except Exception:
+            apply_music_metadata(list_item, label, track_number=mix_position)
+
+        playlist.add(track, list_item)
+
+    xbmc.Player().play(playlist)
+
 
 
 def play_track(path: str) -> None:
@@ -1890,7 +4047,10 @@ def play_track(path: str) -> None:
 
 def open_settings() -> None:
     ADDON.openSettings()
-    show_root()
+    try:
+        xbmc.executebuiltin(f"Container.Update({addon_url(nonce=new_nonce())},replace)")
+    except Exception:
+        pass
 
 
 def router() -> None:
@@ -1899,6 +4059,38 @@ def router() -> None:
 
     if not action:
         show_root()
+        return
+
+    if action == "mix_info":
+        cache_path = params.get("cache_path", "").strip()
+        if cache_path:
+            show_mix_info(cache_path)
+        else:
+            show_selected_mix_info()
+        return
+
+    if action == "mix_info_selected":
+        show_selected_mix_info()
+        return
+
+    if action == "discovery_mode":
+        show_discovery_mode_menu()
+        return
+
+    if action == "discovery_start":
+        start_discovery_mode()
+        return
+
+    if action == "discovery_stop":
+        stop_discovery_mode()
+        return
+
+    if action == "discovery_next":
+        discovery_next_track()
+        return
+
+    if action == "discovery_mix_current":
+        discovery_mix_from_current()
         return
 
     if action == "saved_mixes":
@@ -1923,7 +4115,7 @@ def router() -> None:
         try:
             removed = cleanup_saved_mixes_for_date(date_key, include_older=include_older)
         except Exception as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             return
         if include_older:
@@ -1941,7 +4133,7 @@ def router() -> None:
         try:
             delete_saved_mix_files(cache_path)
         except Exception as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             return
         notify("Removed mix.")
@@ -1965,6 +4157,16 @@ def router() -> None:
         xbmc.executebuiltin("Container.Refresh")
         return
 
+    if action == "update_library_before_repair":
+        cache_path = params.get("cache_path", "").strip()
+        if not cache_path:
+            notify("No saved mix was selected.", xbmcgui.NOTIFICATION_ERROR)
+            return
+
+        show_update_library_before_repair(cache_path)
+        xbmc.executebuiltin("Container.Refresh")
+        return
+
     if action == "repair_mix":
         cache_path = params.get("cache_path", "").strip()
         if not cache_path:
@@ -1972,9 +4174,10 @@ def router() -> None:
             return
 
         try:
+            ensure_repair_ready(cache_path)
             repaired = repair_saved_mix_foreground(cache_path)
         except MusicIPError as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             xbmc.executebuiltin("Container.Refresh")
             return
@@ -2053,7 +4256,7 @@ def router() -> None:
             ensure_remove_allowed_from_addon_container()
             removed_path = remove_track_from_mix(seed, size, index, path, cache_path=cache_path)
         except MusicIPError as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             return
 
@@ -2078,7 +4281,7 @@ def router() -> None:
             ensure_remove_allowed_from_addon_container()
             inserted = insert_more_like_this_into_mix(seed, size, index, path, cache_path=cache_path)
         except MusicIPError as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             return
 
@@ -2102,7 +4305,7 @@ def router() -> None:
             ensure_remove_allowed_from_addon_container()
             removed = remove_less_like_this_from_mix(seed, size, index, path, cache_path=cache_path)
         except MusicIPError as exc:
-            notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+            notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
             return
 
@@ -2128,7 +4331,7 @@ if __name__ == "__main__":
         router()
     except Exception as exc:  # pragma: no cover - defensive logging in Kodi runtime
         log(f"Unhandled error: {exc}", xbmc.LOGERROR)
-        notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+        notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
         try:
             xbmcplugin.endOfDirectory(HANDLE, succeeded=False, cacheToDisc=False)
         except Exception:
