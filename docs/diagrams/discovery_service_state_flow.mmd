@@ -1,0 +1,25 @@
+stateDiagram-v2
+    [*] --> Off
+
+    Off --> Starting: Start discovery mode
+    Starting --> Active: Initial queue built and playback started
+    Starting --> Off: Library lookup failed
+
+    Active --> Active: Excerpt not elapsed
+    Active --> Active: Append future songs
+    Active --> Active: Prune old backlog
+    Active --> Active: Manual next
+    Active --> MixDialogHold: Generate mix from current discovery song
+    Active --> ExternalPlaybackStopped: Current playback not in Discovery queue
+    Active --> Off: Stop discovery mode
+    Active --> Off: Kodi player stopped
+
+    MixDialogHold --> Active: Cancel and dialog time < excerpt length
+    MixDialogHold --> Active: Cancel and dialog time >= excerpt length / skip next
+    MixDialogHold --> MixPlayback: Confirm mix creation
+
+    MixPlayback --> Off: Discovery stopped, mix playing
+
+    ExternalPlaybackStopped --> Off: stop_reason=external_playback
+
+    Off --> [*]

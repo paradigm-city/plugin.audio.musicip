@@ -1,0 +1,29 @@
+sequenceDiagram
+    participant U as User
+    participant UI as MusicIP UI
+    participant S as Discovery Service
+    participant M as MusicIP Server
+    participant K as Kodi Player
+
+    U->>UI: Generate mix from current discovery song
+    UI->>UI: Capture current_song as seed
+    UI->>S: Set mix_dialog_active
+    Note over S: Auto-skip paused; playback continues
+    UI->>U: Show mix parameter dialog
+
+    alt User confirms
+        UI->>M: Request mix with captured seed and parameters
+        M-->>UI: Track list
+        UI->>S: Disable Discovery state
+        UI->>K: Stop Discovery playback
+        UI->>K: Play generated mix
+        UI->>UI: Show generated mix screen
+    else User cancels before excerpt length
+        UI->>S: Clear mix_dialog_active
+        Note over S: Existing excerpt timer continues
+        UI->>UI: Return to Discovery screen
+    else User cancels after excerpt length
+        UI->>S: Clear mix_dialog_active
+        UI->>K: GoTo next Discovery song
+        UI->>UI: Return to Discovery screen
+    end

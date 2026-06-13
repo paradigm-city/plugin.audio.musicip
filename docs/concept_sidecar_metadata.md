@@ -1,0 +1,37 @@
+# Sidecar Metadata Concept
+
+Sidecar metadata keeps saved mixes inspectable and repairable.
+
+## Important sections
+
+```json
+{
+  "seed": "...",
+  "size": 25,
+  "track_count": 25,
+  "label": "...",
+  "updated_ts": 1770000000,
+  "modified_ts": 1770000000,
+  "cache_path": "...",
+  "mix_parameters": {},
+  "consistency": {},
+  "repair_readiness": {},
+  "discovery": {}
+}
+```
+
+## Mix parameters
+
+Mix generation parameters are recorded so a saved mix can later explain how it was created.
+
+## Consistency
+
+The consistency section describes missing files and when they were first detected.
+
+## Repair readiness
+
+The repair readiness section records the Kodi library timestamps used to decide whether auto-repair is safe.
+
+## Discovery relation
+
+When a mix is generated from Discovery mode, the seed should be the captured Discovery song at the moment the user selected the action, not whatever happens to play later while the dialog is open.

@@ -1,0 +1,23 @@
+flowchart LR
+    A[Discovery queue state] --> B[Current Kodi playlist]
+    B --> C[Backlog: keep up to 10 previous items]
+    B --> D[Current item]
+    B --> E[Future buffer: keep about 10 items ahead]
+
+    D --> F{Future remaining < threshold?}
+    F -- Yes --> G[Pick random songs from Kodi library]
+    G --> H[Append items at playlist end]
+    H --> E
+    F -- No --> I[No refill needed]
+
+    D --> J{Backlog > 10?}
+    J -- Yes --> K[Remove old items from top]
+    K --> L[Adjust stored current position]
+    J -- No --> M[Keep playlist unchanged]
+
+    N[Manual skip] --> O[Player.GoTo current+1]
+    O --> P[Update state immediately]
+    P --> D
+
+    Q[Automatic excerpt elapsed] --> R[Service Player.GoTo next]
+    R --> P

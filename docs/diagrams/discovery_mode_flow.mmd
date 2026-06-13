@@ -1,0 +1,44 @@
+flowchart TD
+    A[User opens MusicIP root] --> B[Open Discovery mode screen]
+    B --> C{Discovery active?}
+    C -- No --> D[Start discovery mode]
+    D --> E[Reset stale state]
+    E --> F[Load random songs from Kodi audio library]
+    F --> G[Build initial playlist buffer]
+    G --> H[Start Kodi playlist playback]
+    H --> I[Service owns Discovery state]
+    C -- Yes --> I
+
+    I --> J[Track current playlist position]
+    J --> K[Maintain queue]
+    K --> L[Append future songs at end]
+    K --> M[Prune top only after 10-song backlog]
+    J --> N{Excerpt elapsed?}
+    N -- Yes --> O[GoTo next playlist position]
+    O --> J
+    N -- No --> P[Continue playback]
+
+    I --> Q{User action}
+    Q --> R[Skip to next discovery song]
+    R --> S[Direct Player.GoTo next]
+    S --> T[Update current song and timer immediately]
+    T --> J
+
+    Q --> U[Generate mix from current discovery song]
+    U --> V[Capture seed immediately]
+    V --> W[Mix dialog hold]
+    W --> X{User confirms?}
+    X -- Yes --> Y[Stop Discovery mode]
+    Y --> Z[Generate and play MusicIP mix]
+    X -- No --> AA{Dialog time >= excerpt length?}
+    AA -- Yes --> AB[Skip directly to next discovery song]
+    AA -- No --> AC[Continue existing excerpt timer]
+
+    Q --> AD[Stop discovery mode]
+    AD --> AE[Disable Discovery state]
+    AE --> AF[Stop playback and clear Discovery playlist]
+
+    I --> AG{External playback takeover?}
+    AG -- Yes --> AH[Disable Discovery only]
+    AH --> AI[Leave external playback untouched]
+    AG -- No --> J
