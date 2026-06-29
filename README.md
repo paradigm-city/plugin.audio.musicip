@@ -114,3 +114,163 @@ is visible in the mix view, with `%N` reflecting the generated mix position.
 
 Discovery mode remains unchanged.
 
+## Mix editing keyboard shortcuts 1.0.93
+
+Mix rows now expose keyboard shortcut actions in the Kodi music window:
+
+- `DEL` → Remove from mix
+- `+` / Numpad `+` → More like this
+- `-` / Numpad `-` → Less like this
+
+The keymap is shipped as:
+
+```text
+resources/keymaps/musicip_mix_editing.xml
+```
+
+The shortcut handlers only act on selected MusicIP mix rows that expose the matching `MusicIP.MixAction.*` properties. Discovery mode is unchanged.
+
+## Mix editing keyboard shortcuts update 1.0.94
+
+The mix editing keymap was adjusted:
+
+- `DEL` → Remove from mix
+- `m` → More like this
+- `l` → Less like this
+
+The previous `+` / `-` bindings were removed.
+
+The shortcut keymap now targets multiple Kodi music window contexts for better reliability:
+
+- `MyMusicNav`
+- `MusicPlaylist`
+- `MusicFiles`
+
+For `DEL`, both `<delete>` and `<del>` are included.
+
+Discovery mode remains unchanged.
+
+## Keymap installation and icon fix 1.0.95
+
+The mix editing keymap is now actively installed into Kodi's user keymap folder:
+
+```text
+special://profile/keymaps/musicip_mix_editing.xml
+```
+
+and reloaded with `ReloadKeymaps` when it changes.
+
+The key bindings now also target the numeric Kodi music navigation window:
+
+```text
+window10502
+```
+
+This addresses cases where Kodi reports the active music window as `10502` and no action is mapped.
+
+Also, the add-on package now really includes the agreed abstract orb icon as `icon.png`.
+
+## Track metadata cache phase 1 – 1.0.96
+
+This build introduces the first phase of metadata caching for generated mixes.
+
+What changes:
+
+- generated mix rows first use sidecar metadata snapshots
+- if no sidecar snapshot exists, the add-on uses a global SQLite metadata cache
+- live Kodi JSON-RPC lookup is now only the last fallback
+- generated mix playback reuses preloaded metadata instead of looking up each track again
+- the mix sidecar now records per-track metadata snapshots
+
+Phase 1 goal:
+- reduce repeated JSON-RPC metadata lookups when reopening or replaying mixes
+
+Phase 2 is still open:
+- background metadata refresh for stale or missing cache entries
+- queued refresh batches without blocking the mix view
+
+Discovery mode remains unchanged.
+
+## Metadata cache phase 1 hotfix – 1.0.97
+
+Fixed a regression from 1.0.96 when opening a mix:
+
+```text
+name 'KODI_MUSIC_TRACK_TEMPLATE_CACHE' is not defined
+```
+
+This build only hardens the Kodi track-label template cache initialization.
+The phase 1 metadata cache concept remains unchanged.
+
+## Verified metadata cache hotfix – 1.0.98
+
+This build carries forward and tightens the 1.0.97 fix for:
+
+```text
+name 'KODI_MUSIC_TRACK_TEMPLATE_CACHE' is not defined
+```
+
+No new feature was added.
+
+The Kodi track-label template globals are now explicitly initialized together:
+
+- `KODI_MUSIC_TRACK_TEMPLATE_CACHE`
+- `KODI_MUSIC_TRACK_TEMPLATE_FALLBACK`
+- `KODI_MUSIC_TRACK_TEMPLATE_SETTING_CANDIDATES`
+
+Additional pre-package checks were run for the mix-opening path, metadata cache path, keymap install, icon, and Discovery preservation.
+
+## Metadata lookup repair – 1.0.99
+
+This build fixes a regression where mix metadata could appear missing after the phase 1 cache change.
+
+Fixes:
+
+- `songid` is no longer requested as a Kodi `AudioLibrary.GetSongs` property
+- metadata lookup retries with a reduced safe property list if Kodi rejects the full property list
+- stale/empty sidecar snapshots are no longer accepted only because they contain `cached_ts`
+- existing empty sidecar snapshots from 1.0.96/1.0.97/1.0.98 are ignored and live lookup is attempted again
+
+No background refresh is included yet.
+
+## Background metadata refresh – 1.0.100
+
+This build adds phase 2 of the metadata cache work.
+
+Mix rendering now avoids live per-track JSON-RPC metadata lookups. The mix list is built from:
+
+1. per-mix sidecar metadata
+2. global SQLite metadata cache
+3. fallback filename/path display
+
+Missing or stale metadata is queued in:
+
+```text
+metadata_refresh_queue.json
+```
+
+The background service processes the queue in small batches, writes refreshed data to:
+
+```text
+track_metadata_cache.db
+```
+
+and updates the relevant mix sidecar snapshots. If the currently visible container is a MusicIP mix view, the service refreshes it once after a successful batch.
+
+Discovery mode behavior remains unchanged.
+
+## Selection-triggered metadata presentation – 1.0.101
+
+This build changes phase 2 presentation behavior.
+
+1.0.100 refreshed the visible mix view immediately after a successful background metadata batch. In 1.0.101 the service instead marks the visible mix view as having updated metadata available and waits for the next selection movement.
+
+Flow:
+
+1. mix opens quickly from sidecar/cache/fallback labels
+2. background service fills missing metadata
+3. service marks the visible mix view as pending refresh
+4. when the user moves the selection, the service rebuilds the container once
+
+This presents updated metadata without requiring manual navigation out and back into the mix, while avoiding sudden list rebuilds during passive viewing.
+

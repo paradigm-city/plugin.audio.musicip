@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import random
+import sqlite3
 import re
 import sys
 import time
@@ -32,10 +33,122 @@ HANDLE = int(sys.argv[1]) if len(sys.argv) > 1 and str(sys.argv[1]).lstrip("-").
 BASE_URL = sys.argv[0] if len(sys.argv) > 0 else ""
 
 LAST_MIX_GENERATION_PARAMS: dict[str, dict] = {}
+AUDIO_LIBRARY_FRESHNESS_CACHE = {"fetched_ts": 0, "payload": {}}
+TRACK_METADATA_CACHE_SCHEMA_VERSION = 1
+SONG_METADATA_PROPERTIES = [
+    "title",
+    "artist",
+    "displayartist",
+    "album",
+    "albumartist",
+    "genre",
+    "file",
+    "year",
+    "duration",
+    "track",
+    "thumbnail",
+    "fanart",
+]
+SONG_METADATA_SAFE_PROPERTIES = [
+    "title",
+    "artist",
+    "album",
+    "genre",
+    "year",
+    "duration",
+    "thumbnail",
+    "fanart",
+]
+
+KODI_MUSIC_TRACK_TEMPLATE_CACHE = None
+KODI_MUSIC_TRACK_TEMPLATE_FALLBACK = "[%N. ]%A - %T"
+KODI_MUSIC_TRACK_TEMPLATE_SETTING_CANDIDATES = [
+    "musicfiles.trackformat",
+    "musiclibrary.trackformat",
+    "musicplayer.trackformat",
+    "musicfiles.librarytrackformat",
+]
+
 
 
 class MusicIPError(Exception):
     """Raised for user-facing MusicIP failures."""
+
+
+MUSICIP_KEYMAP_FILENAME = "musicip_mix_editing.xml"
+MUSICIP_KEYMAP_CONTENT = r"""<?xml version="1.0" encoding="UTF-8"?>
+<keymap>
+  <MyMusicNav>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </MyMusicNav>
+
+  <window10502>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </window10502>
+
+  <MusicPlaylist>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </MusicPlaylist>
+
+  <MusicFiles>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </MusicFiles>
+</keymap>
+"""
+
+
+def get_kodi_user_keymap_dir() -> str:
+    path = xbmcvfs.translatePath("special://profile/keymaps")
+    if not xbmcvfs.exists(path):
+        xbmcvfs.mkdirs(path)
+    return path
+
+
+def get_musicip_user_keymap_path() -> str:
+    return os.path.join(get_kodi_user_keymap_dir(), MUSICIP_KEYMAP_FILENAME)
+
+
+def ensure_musicip_keymap_installed() -> None:
+    target = get_musicip_user_keymap_path()
+    current = ""
+    try:
+        if os.path.exists(target):
+            with open(target, "r", encoding="utf-8") as fh:
+                current = fh.read()
+    except Exception as exc:
+        log(f"Could not read existing MusicIP keymap: {exc}", xbmc.LOGWARNING)
+
+    if current == MUSICIP_KEYMAP_CONTENT:
+        return
+
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(MUSICIP_KEYMAP_CONTENT)
+        xbmc.executebuiltin("ReloadKeymaps")
+        log(f"Installed MusicIP keymap to {target} and reloaded keymaps.", xbmc.LOGINFO)
+    except Exception as exc:
+        log(f"Could not install MusicIP keymap to {target}: {exc}", xbmc.LOGERROR)
 
 
 def log(message: str, level: int = xbmc.LOGINFO) -> None:
@@ -648,6 +761,513 @@ def mix_cache_key(seed: str, size: int) -> str:
     return hashlib.sha1(payload).hexdigest()
 
 
+def get_audio_library_freshness_cached(max_age: int = 15, allow_query: bool = True) -> dict:
+    global AUDIO_LIBRARY_FRESHNESS_CACHE
+
+    now = int(time.time())
+    payload = AUDIO_LIBRARY_FRESHNESS_CACHE.get("payload") or {}
+    fetched_ts = int(AUDIO_LIBRARY_FRESHNESS_CACHE.get("fetched_ts") or 0)
+
+    if payload and fetched_ts > 0 and now - fetched_ts <= max_age:
+        return payload
+
+    if not allow_query:
+        return payload
+
+    payload = get_audio_library_freshness()
+    AUDIO_LIBRARY_FRESHNESS_CACHE = {
+        "fetched_ts": now,
+        "payload": payload,
+    }
+    return payload
+
+
+def get_cached_audio_library_freshest_ts(allow_query: bool = True) -> int:
+    freshness = get_audio_library_freshness_cached(allow_query=allow_query)
+    return int((freshness or {}).get("freshest_ts") or 0)
+
+
+def get_track_metadata_cache_db_path() -> str:
+    return os.path.join(get_profile_dir(), "track_metadata_cache.db")
+
+
+def get_track_metadata_cache_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(get_track_metadata_cache_db_path())
+    connection.row_factory = sqlite3.Row
+    ensure_track_metadata_cache_schema(connection)
+    return connection
+
+
+def ensure_track_metadata_cache_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS track_metadata_cache (
+            path TEXT PRIMARY KEY,
+            songid INTEGER DEFAULT 0,
+            title TEXT DEFAULT '',
+            artist TEXT DEFAULT '',
+            album TEXT DEFAULT '',
+            genre_json TEXT DEFAULT '[]',
+            year INTEGER DEFAULT 0,
+            decade TEXT DEFAULT '',
+            duration INTEGER DEFAULT 0,
+            thumbnail TEXT DEFAULT '',
+            fanart TEXT DEFAULT '',
+            cached_ts INTEGER DEFAULT 0,
+            library_freshest_ts INTEGER DEFAULT 0,
+            schema_version INTEGER DEFAULT 1
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_track_metadata_cache_songid "
+        "ON track_metadata_cache(songid)"
+    )
+    connection.commit()
+
+
+def build_empty_track_metadata(path: str) -> dict[str, object]:
+    return {
+        "songid": 0,
+        "title": path_to_label(path),
+        "artist": "",
+        "album": "",
+        "genre": [],
+        "year": 0,
+        "decade": "",
+        "duration": 0,
+        "thumbnail": "",
+        "fanart": "",
+        "cached_ts": 0,
+        "library_freshest_ts": 0,
+    }
+
+
+def normalize_track_metadata_snapshot(
+    path: str,
+    metadata: dict | None,
+    cached_ts: int | None = None,
+    library_freshest_ts: int | None = None,
+) -> dict[str, object]:
+    snapshot = build_empty_track_metadata(path)
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    try:
+        snapshot["songid"] = int(metadata.get("songid") or 0)
+    except Exception:
+        snapshot["songid"] = 0
+
+    title = str(metadata.get("title") or "").strip()
+    if title:
+        snapshot["title"] = title
+
+    snapshot["artist"] = str(metadata.get("artist") or "").strip()
+    snapshot["album"] = str(metadata.get("album") or "").strip()
+    snapshot["genre"] = normalize_genres(metadata.get("genre"))
+    snapshot["year"] = parse_year(metadata.get("year"))
+    snapshot["decade"] = str(metadata.get("decade") or format_decade(snapshot["year"]))
+    snapshot["duration"] = parse_duration_seconds(metadata.get("duration"))
+    snapshot["thumbnail"] = str(metadata.get("thumbnail") or "").strip()
+    snapshot["fanart"] = str(metadata.get("fanart") or "").strip()
+
+    try:
+        snapshot["cached_ts"] = int(
+            cached_ts
+            if cached_ts is not None
+            else (metadata.get("cached_ts") or 0)
+        )
+    except Exception:
+        snapshot["cached_ts"] = 0
+
+    try:
+        snapshot["library_freshest_ts"] = int(
+            library_freshest_ts
+            if library_freshest_ts is not None
+            else (metadata.get("library_freshest_ts") or 0)
+        )
+    except Exception:
+        snapshot["library_freshest_ts"] = 0
+
+    return snapshot
+
+
+def track_metadata_snapshot_has_payload(path: str, metadata: dict | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+
+    fallback_title = path_to_label(path)
+    title = str(metadata.get("title") or "").strip()
+
+    return bool(
+        int(metadata.get("songid") or 0) > 0
+        or (title and title != fallback_title)
+        or str(metadata.get("artist") or "").strip()
+        or str(metadata.get("album") or "").strip()
+        or normalize_genres(metadata.get("genre"))
+        or parse_year(metadata.get("year")) > 0
+        or parse_duration_seconds(metadata.get("duration")) > 0
+        or str(metadata.get("thumbnail") or "").strip()
+        or str(metadata.get("fanart") or "").strip()
+    )
+
+def read_track_metadata_cache(path: str) -> dict[str, object]:
+    cache_key = canonical_audio_path(path)
+    if not cache_key:
+        return {}
+
+    try:
+        connection = get_track_metadata_cache_connection()
+        try:
+            row = connection.execute(
+                """
+                SELECT path, songid, title, artist, album, genre_json, year, decade,
+                       duration, thumbnail, fanart, cached_ts, library_freshest_ts
+                FROM track_metadata_cache
+                WHERE path = ?
+                """,
+                (cache_key,),
+            ).fetchone()
+        finally:
+            connection.close()
+    except Exception as exc:
+        log(f"Track metadata cache read failed for {path!r}: {exc}", xbmc.LOGDEBUG)
+        return {}
+
+    if row is None:
+        return {}
+
+    try:
+        genres = json.loads(row["genre_json"] or "[]")
+    except Exception:
+        genres = []
+
+    snapshot = normalize_track_metadata_snapshot(
+        path,
+        {
+            "songid": row["songid"],
+            "title": row["title"],
+            "artist": row["artist"],
+            "album": row["album"],
+            "genre": genres,
+            "year": row["year"],
+            "decade": row["decade"],
+            "duration": row["duration"],
+            "thumbnail": row["thumbnail"],
+            "fanart": row["fanart"],
+            "cached_ts": row["cached_ts"],
+            "library_freshest_ts": row["library_freshest_ts"],
+        },
+    )
+    return snapshot if track_metadata_snapshot_has_payload(path, snapshot) else {}
+
+
+def write_track_metadata_cache(path: str, metadata: dict | None) -> None:
+    snapshot = normalize_track_metadata_snapshot(path, metadata)
+    if not track_metadata_snapshot_has_payload(path, snapshot):
+        return
+
+    cache_key = canonical_audio_path(path)
+    if not cache_key:
+        return
+
+    try:
+        connection = get_track_metadata_cache_connection()
+        try:
+            connection.execute(
+                """
+                INSERT INTO track_metadata_cache (
+                    path, songid, title, artist, album, genre_json, year, decade,
+                    duration, thumbnail, fanart, cached_ts, library_freshest_ts, schema_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    songid = excluded.songid,
+                    title = excluded.title,
+                    artist = excluded.artist,
+                    album = excluded.album,
+                    genre_json = excluded.genre_json,
+                    year = excluded.year,
+                    decade = excluded.decade,
+                    duration = excluded.duration,
+                    thumbnail = excluded.thumbnail,
+                    fanart = excluded.fanart,
+                    cached_ts = excluded.cached_ts,
+                    library_freshest_ts = excluded.library_freshest_ts,
+                    schema_version = excluded.schema_version
+                """,
+                (
+                    cache_key,
+                    int(snapshot.get("songid") or 0),
+                    str(snapshot.get("title") or ""),
+                    str(snapshot.get("artist") or ""),
+                    str(snapshot.get("album") or ""),
+                    json.dumps(normalize_genres(snapshot.get("genre")), ensure_ascii=False),
+                    int(snapshot.get("year") or 0),
+                    str(snapshot.get("decade") or ""),
+                    int(snapshot.get("duration") or 0),
+                    str(snapshot.get("thumbnail") or ""),
+                    str(snapshot.get("fanart") or ""),
+                    int(snapshot.get("cached_ts") or 0),
+                    int(snapshot.get("library_freshest_ts") or 0),
+                    TRACK_METADATA_CACHE_SCHEMA_VERSION,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    except Exception as exc:
+        log(f"Track metadata cache write failed for {path!r}: {exc}", xbmc.LOGDEBUG)
+
+
+def build_sidecar_track_metadata_map(meta: dict | None) -> dict[str, dict]:
+    meta = meta if isinstance(meta, dict) else {}
+    raw = meta.get("track_metadata_by_path")
+    if not isinstance(raw, dict):
+        return {}
+
+    normalized: dict[str, dict] = {}
+    for key, value in raw.items():
+        cache_key = canonical_audio_path(str(key or ""))
+        if not cache_key or not isinstance(value, dict):
+            continue
+        snapshot = normalize_track_metadata_snapshot(key, value)
+        if track_metadata_snapshot_has_payload(key, snapshot):
+            normalized[cache_key] = snapshot
+
+    return normalized
+
+
+def collect_mix_track_metadata(
+    tracks: list[str],
+    sidecar_map: dict[str, dict] | None = None,
+    allow_live_lookup: bool = True,
+) -> list[dict]:
+    sidecar_map = sidecar_map if isinstance(sidecar_map, dict) else {}
+    metadata_list: list[dict] = []
+
+    for track in tracks:
+        cache_key = canonical_audio_path(track)
+        sidecar_snapshot = sidecar_map.get(cache_key) if cache_key else None
+        metadata_list.append(
+            get_track_metadata(
+                track,
+                sidecar_snapshot=sidecar_snapshot,
+                allow_live_lookup=allow_live_lookup,
+            )
+        )
+
+    return metadata_list
+
+
+def build_mix_track_metadata_snapshot_map(
+    tracks: list[str],
+    metadata_list: list[dict] | None,
+) -> dict[str, dict]:
+    metadata_list = metadata_list if isinstance(metadata_list, list) else []
+    snapshot_map: dict[str, dict] = {}
+
+    for index, track in enumerate(tracks):
+        cache_key = canonical_audio_path(track)
+        if not cache_key:
+            continue
+
+        source = metadata_list[index] if index < len(metadata_list) and isinstance(metadata_list[index], dict) else {}
+        snapshot = normalize_track_metadata_snapshot(
+            track,
+            source,
+            cached_ts=int(source.get("cached_ts") or int(time.time())) if isinstance(source, dict) else int(time.time()),
+            library_freshest_ts=int(source.get("library_freshest_ts") or 0) if isinstance(source, dict) else 0,
+        )
+        if track_metadata_snapshot_has_payload(track, snapshot):
+            snapshot_map[cache_key] = snapshot
+
+    return snapshot_map
+
+
+def set_mix_track_metadata_snapshot(
+    cache_path: str,
+    tracks: list[str],
+    metadata_list: list[dict] | None,
+) -> None:
+    if not tracks:
+        return
+
+    meta = get_saved_mix_metadata(cache_path, tracks)
+    snapshot_map = build_mix_track_metadata_snapshot_map(tracks, metadata_list)
+
+    if not snapshot_map:
+        return
+
+    meta["track_count"] = len(tracks)
+    meta["track_metadata_by_path"] = snapshot_map
+    meta["track_metadata_cached_ts"] = int(time.time())
+
+    freshest_ts = 0
+    for item in metadata_list or []:
+        try:
+            freshest_ts = max(freshest_ts, int(item.get("library_freshest_ts") or 0))
+        except Exception:
+            pass
+
+    if freshest_ts > 0:
+        meta["track_metadata_library_freshest_ts"] = freshest_ts
+
+    save_json_file(mix_meta_path_from_cache_path(cache_path), meta)
+
+
+def get_metadata_refresh_queue_path() -> str:
+    return os.path.join(get_profile_dir(), "metadata_refresh_queue.json")
+
+
+def load_metadata_refresh_queue() -> dict:
+    payload = load_json_file(get_metadata_refresh_queue_path())
+    if not isinstance(payload, dict):
+        payload = {}
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    return {
+        "version": 1,
+        "updated_ts": int(payload.get("updated_ts") or 0),
+        "entries": entries,
+    }
+
+
+def save_metadata_refresh_queue(queue: dict) -> None:
+    entries = queue.get("entries") if isinstance(queue, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    save_json_file(
+        get_metadata_refresh_queue_path(),
+        {
+            "version": 1,
+            "updated_ts": int(time.time()),
+            "entries": entries,
+        },
+    )
+
+
+def track_metadata_needs_background_refresh(
+    path: str,
+    metadata: dict | None,
+    library_freshest_ts: int,
+) -> tuple[bool, str]:
+    if not track_metadata_snapshot_has_payload(path, metadata):
+        return True, "missing"
+
+    if library_freshest_ts <= 0:
+        return False, ""
+
+    try:
+        metadata_library_ts = int((metadata or {}).get("library_freshest_ts") or 0)
+    except Exception:
+        metadata_library_ts = 0
+
+    try:
+        metadata_cached_ts = int((metadata or {}).get("cached_ts") or 0)
+    except Exception:
+        metadata_cached_ts = 0
+
+    if metadata_library_ts > 0 and metadata_library_ts < library_freshest_ts:
+        return True, "stale"
+
+    if metadata_library_ts <= 0 and metadata_cached_ts > 0 and metadata_cached_ts < library_freshest_ts:
+        return True, "stale"
+
+    if metadata_library_ts <= 0 and metadata_cached_ts <= 0:
+        return True, "missing_timestamp"
+
+    return False, ""
+
+
+def enqueue_metadata_refresh_for_tracks(
+    tracks: list[str],
+    cache_path: str = "",
+    metadata_list: list[dict] | None = None,
+    reason_context: str = "",
+) -> int:
+    if not tracks:
+        return 0
+
+    metadata_list = metadata_list if isinstance(metadata_list, list) else []
+    library_freshest_ts = get_cached_audio_library_freshest_ts(allow_query=True)
+
+    queue = load_metadata_refresh_queue()
+    existing_entries = queue.get("entries") if isinstance(queue, dict) else []
+    if not isinstance(existing_entries, list):
+        existing_entries = []
+
+    entries_by_key: dict[str, dict] = {}
+    order: list[str] = []
+
+    for entry in existing_entries:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "").strip()
+        key = canonical_audio_path(path)
+        if not key:
+            continue
+
+        cache_paths = entry.get("cache_paths")
+        if not isinstance(cache_paths, list):
+            cache_paths = []
+        entry["cache_paths"] = [str(item) for item in cache_paths if str(item or "").strip()]
+        entries_by_key[key] = entry
+        order.append(key)
+
+    queued_count = 0
+    now = int(time.time())
+
+    for index, track in enumerate(tracks):
+        key = canonical_audio_path(track)
+        if not key:
+            continue
+
+        metadata = metadata_list[index] if index < len(metadata_list) and isinstance(metadata_list[index], dict) else {}
+        needs_refresh, reason = track_metadata_needs_background_refresh(track, metadata, library_freshest_ts)
+        if not needs_refresh:
+            continue
+
+        if key not in entries_by_key:
+            entries_by_key[key] = {
+                "path": track,
+                "cache_paths": [],
+                "queued_ts": now,
+                "updated_ts": now,
+                "attempts": 0,
+                "reason": reason,
+                "context": reason_context,
+            }
+            order.append(key)
+            queued_count += 1
+        else:
+            entries_by_key[key]["updated_ts"] = now
+            entries_by_key[key]["reason"] = reason or entries_by_key[key].get("reason") or "refresh"
+            if reason_context:
+                entries_by_key[key]["context"] = reason_context
+
+        if cache_path:
+            cache_paths = entries_by_key[key].get("cache_paths")
+            if not isinstance(cache_paths, list):
+                cache_paths = []
+            if cache_path not in cache_paths:
+                cache_paths.append(cache_path)
+            entries_by_key[key]["cache_paths"] = cache_paths
+
+    if queued_count or cache_path:
+        queue["entries"] = [entries_by_key[key] for key in order if key in entries_by_key]
+        save_metadata_refresh_queue(queue)
+
+    if queued_count:
+        log(
+            f"Queued {queued_count} track(s) for background metadata refresh "
+            f"context={reason_context!r}, cache_path={cache_path!r}.",
+            xbmc.LOGINFO,
+        )
+
+    return queued_count
+
+
 def mix_cache_path(seed: str, size: int) -> str:
     return os.path.join(get_profile_dir(), f"mix_{mix_cache_key(seed, size)}.m3u")
 
@@ -678,7 +1298,7 @@ def load_json_file(path: str) -> dict:
         return {}
 
 
-def save_mix(seed: str, size: int, tracks: list[str]) -> None:
+def save_mix(seed: str, size: int, tracks: list[str], track_metadata_list: list[dict] | None = None) -> None:
     path = mix_cache_path(seed, size)
     payload = "\n".join(tracks)
     handle = xbmcvfs.File(path, "w")
@@ -687,21 +1307,37 @@ def save_mix(seed: str, size: int, tracks: list[str]) -> None:
     finally:
         handle.close()
 
-    meta = {
+    meta = load_json_file(mix_meta_path_from_cache_path(path))
+    if not isinstance(meta, dict):
+        meta = {}
+
+    meta.update({
         "seed": seed,
         "size": size,
         "track_count": len(tracks),
         "label": path_to_label(seed),
         "updated_ts": int(time.time()),
-    }
+    })
 
     generation_params = pop_mix_generation_parameters(seed, size)
     if generation_params:
         meta["mix_generation_parameters"] = generation_params
         meta["mix_generation_parameters_ts"] = int(time.time())
 
-    save_json_file(mix_meta_path_from_cache_path(path), meta)
+    if isinstance(track_metadata_list, list) and track_metadata_list:
+        meta["track_metadata_by_path"] = build_mix_track_metadata_snapshot_map(tracks, track_metadata_list)
+        meta["track_metadata_cached_ts"] = int(time.time())
 
+        freshest_ts = 0
+        for item in track_metadata_list:
+            try:
+                freshest_ts = max(freshest_ts, int(item.get("library_freshest_ts") or 0))
+            except Exception:
+                pass
+        if freshest_ts > 0:
+            meta["track_metadata_library_freshest_ts"] = freshest_ts
+
+    save_json_file(mix_meta_path_from_cache_path(path), meta)
 
 def save_mix_by_cache_path(cache_path: str, tracks: list[str]) -> None:
     payload = "\n".join(tracks)
@@ -2173,25 +2809,40 @@ def build_repair_hints(old_path: str) -> dict:
     }
 
 
+def audio_library_get_songs_with_metadata_properties(params: dict, context: str) -> list[dict]:
+    request_params = dict(params or {})
+    request_params["properties"] = SONG_METADATA_PROPERTIES
+
+    try:
+        result = execute_jsonrpc("AudioLibrary.GetSongs", request_params)
+        return result.get("songs") or []
+    except Exception as exc:
+        log(f"{context}: metadata lookup failed with full properties: {exc}", xbmc.LOGDEBUG)
+
+    safe_params = dict(params or {})
+    safe_params["properties"] = SONG_METADATA_SAFE_PROPERTIES
+
+    try:
+        result = execute_jsonrpc("AudioLibrary.GetSongs", safe_params)
+        songs = result.get("songs") or []
+        log(f"{context}: metadata lookup retried with safe properties; returned {len(songs)} song(s).", xbmc.LOGDEBUG)
+        return songs
+    except Exception as exc:
+        log(f"{context}: metadata lookup failed with safe properties: {exc}", xbmc.LOGDEBUG)
+        return []
+
+
 def query_library_songs_contains(field: str, value: str) -> list[dict]:
     term = (value or "").strip()
     if not term:
         return []
 
-    try:
-        result = execute_jsonrpc(
-            'AudioLibrary.GetSongs',
-            {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'track', 'thumbnail', 'fanart'],
-                'filter': {'field': field, 'operator': 'contains', 'value': term},
-            },
-        )
-    except Exception as exc:
-        log_info(f"Auto-repair fallback: Kodi lookup failed for {field} contains {term!r}: {exc}")
-        return []
-
-    return result.get('songs') or []
-
+    return audio_library_get_songs_with_metadata_properties(
+        {
+            "filter": {"field": field, "operator": "contains", "value": term},
+        },
+        f"Auto-repair fallback {field} contains {term!r}",
+    )
 
 def collect_fallback_repair_candidates(hints: dict) -> list[dict]:
     raw_candidates: list[dict] = []
@@ -2644,53 +3295,37 @@ def query_library_songs_by_filename(filename: str) -> list[dict]:
     if not filename:
         return []
 
-    try:
-        result = execute_jsonrpc(
-            'AudioLibrary.GetSongs',
-            {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'track', 'thumbnail', 'fanart'],
-                'filter': {'field': 'filename', 'operator': 'is', 'value': filename},
-            },
-        )
-    except Exception as exc:
-        log(f"Filename-only library lookup failed for {filename!r}: {exc}", xbmc.LOGDEBUG)
-        return []
-
-    return result.get('songs') or []
-
+    return audio_library_get_songs_with_metadata_properties(
+        {
+            "filter": {"field": "filename", "operator": "is", "value": filename},
+        },
+        f"Filename-only library lookup for {filename!r}",
+    )
 
 def query_library_songs_strict(filename: str, directory: str) -> list[dict]:
     if not filename:
         return []
 
     filters: list[dict] = [
-        {'field': 'filename', 'operator': 'is', 'value': filename},
+        {"field": "filename", "operator": "is", "value": filename},
     ]
 
     path_candidates = build_path_candidates(directory)
-    log(f'Library lookup filename={filename!r} path_candidates={path_candidates!r}', xbmc.LOGDEBUG)
+    log(f"Library lookup filename={filename!r} path_candidates={path_candidates!r}", xbmc.LOGDEBUG)
     if path_candidates:
         filters.append({
-            'or': [
-                {'field': 'path', 'operator': 'is', 'value': candidate}
+            "or": [
+                {"field": "path", "operator": "is", "value": candidate}
                 for candidate in path_candidates
             ]
         })
 
-    try:
-        result = execute_jsonrpc(
-            'AudioLibrary.GetSongs',
-            {
-                'properties': ['title', 'artist', 'displayartist', 'album', 'albumartist', 'genre', 'file', 'year', 'duration', 'track', 'thumbnail', 'fanart'],
-                'filter': {'and': filters},
-            },
-        )
-    except Exception as exc:
-        log(f'Library metadata strict lookup failed for {filename!r}: {exc}', xbmc.LOGDEBUG)
-        return []
-
-    return result.get('songs') or []
-
+    return audio_library_get_songs_with_metadata_properties(
+        {
+            "filter": {"and": filters},
+        },
+        f"Strict library lookup for {filename!r}",
+    )
 
 def first_non_empty_text(value: object) -> str:
     if isinstance(value, list):
@@ -2786,6 +3421,7 @@ def extract_song_metadata(song: dict) -> dict[str, str]:
     year_value = parse_year(song.get('year'))
 
     return {
+        'songid': int(song.get('songid') or 0),
         'title': str(song.get('title') or '').strip(),
         'artist': artist_value,
         'album': str(song.get('album') or '').strip(),
@@ -2804,18 +3440,26 @@ def get_library_track_metadata(path: str) -> dict[str, str]:
         return {}
 
     strict_candidates = query_library_songs_strict(filename, directory)
-    log(f'Strict library lookup returned {len(strict_candidates)} candidate song(s) for {path}', xbmc.LOGDEBUG)
+    log(f"Strict library lookup returned {len(strict_candidates)} candidate song(s) for {path}", xbmc.LOGDEBUG)
 
     matched_song = find_song_by_file_relaxed(strict_candidates, path)
     if matched_song is not None:
         return extract_song_metadata(matched_song)
 
+    if len(strict_candidates) == 1:
+        log("Using single strict library candidate without file-match confirmation.", xbmc.LOGDEBUG)
+        return extract_song_metadata(strict_candidates[0])
+
     filename_candidates = query_library_songs_by_filename(filename)
-    log(f'Filename-only library lookup returned {len(filename_candidates)} candidate song(s) for {path}', xbmc.LOGDEBUG)
+    log(f"Filename-only library lookup returned {len(filename_candidates)} candidate song(s) for {path}", xbmc.LOGDEBUG)
 
     matched_song = find_song_by_file_relaxed(filename_candidates, path)
     if matched_song is not None:
         return extract_song_metadata(matched_song)
+
+    if len(filename_candidates) == 1:
+        log("Using single filename-only library candidate without file-match confirmation.", xbmc.LOGDEBUG)
+        return extract_song_metadata(filename_candidates[0])
 
     if strict_candidates:
         log("No unique relaxed match found in strict library candidates.", xbmc.LOGDEBUG)
@@ -2826,27 +3470,34 @@ def get_library_track_metadata(path: str) -> dict[str, str]:
 
     return {}
 
+def get_track_metadata(
+    path: str,
+    sidecar_snapshot: dict | None = None,
+    allow_live_lookup: bool = True,
+) -> dict[str, object]:
+    metadata = build_empty_track_metadata(path)
 
-def get_track_metadata(path: str) -> dict[str, str]:
-    metadata = {
-        'title': path_to_label(path),
-        'artist': '',
-        'album': '',
-        'genre': [],
-        'year': 0,
-        'decade': '',
-        'duration': 0,
-        'thumbnail': '',
-        'fanart': '',
-    }
+    cached_snapshot = normalize_track_metadata_snapshot(path, sidecar_snapshot)
+    if track_metadata_snapshot_has_payload(path, cached_snapshot):
+        metadata.update(cached_snapshot)
+    else:
+        cache_data = read_track_metadata_cache(path)
+        if cache_data:
+            metadata.update(cache_data)
+        elif allow_live_lookup:
+            library_data = get_library_track_metadata(path)
+            if library_data:
+                snapshot = normalize_track_metadata_snapshot(
+                    path,
+                    library_data,
+                    cached_ts=int(time.time()),
+                    library_freshest_ts=get_cached_audio_library_freshest_ts(allow_query=True),
+                )
+                write_track_metadata_cache(path, snapshot)
+                metadata.update(snapshot)
 
     current_data = get_current_player_metadata(path)
     for key, value in current_data.items():
-        if value:
-            metadata[key] = value
-
-    library_data = get_library_track_metadata(path)
-    for key, value in library_data.items():
         if value:
             metadata[key] = value
 
@@ -2855,16 +3506,6 @@ def get_track_metadata(path: str) -> dict[str, str]:
     metadata['decade'] = format_decade(metadata.get('year'))
     metadata['duration'] = parse_duration_seconds(metadata.get('duration'))
     return metadata
-
-KODI_MUSIC_TRACK_TEMPLATE_CACHE = None
-KODI_MUSIC_TRACK_TEMPLATE_FALLBACK = "[%N. ]%A - %T"
-KODI_MUSIC_TRACK_TEMPLATE_SETTING_CANDIDATES = [
-    "musicfiles.trackformat",
-    "musiclibrary.trackformat",
-    "musicplayer.trackformat",
-    "musicfiles.librarytrackformat",
-]
-
 
 def get_kodi_setting_value_safe(setting_id: str):
     try:
@@ -2877,8 +3518,9 @@ def get_kodi_setting_value_safe(setting_id: str):
 def get_kodi_music_track_template() -> str:
     global KODI_MUSIC_TRACK_TEMPLATE_CACHE
 
-    if KODI_MUSIC_TRACK_TEMPLATE_CACHE:
-        return KODI_MUSIC_TRACK_TEMPLATE_CACHE
+    cached_value = globals().get("KODI_MUSIC_TRACK_TEMPLATE_CACHE")
+    if isinstance(cached_value, str) and cached_value:
+        return cached_value
 
     for setting_id in KODI_MUSIC_TRACK_TEMPLATE_SETTING_CANDIDATES:
         value = get_kodi_setting_value_safe(setting_id)
@@ -2893,7 +3535,6 @@ def get_kodi_music_track_template() -> str:
         xbmc.LOGINFO,
     )
     return KODI_MUSIC_TRACK_TEMPLATE_CACHE
-
 
 def format_template_optional_blocks(template: str, values: dict[str, str]) -> str:
     def replace_optional(match):
@@ -3095,8 +3736,36 @@ def add_error_item(label: str) -> None:
     xbmcplugin.addDirectoryItem(HANDLE, "", item, isFolder=False)
 
 
-def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str = '') -> None:
-    metadata = get_track_metadata(path)
+def run_selected_mix_keyboard_action(property_name: str, action_label: str) -> None:
+    try:
+        command = (xbmc.getInfoLabel(f"ListItem.Property({property_name})") or "").strip()
+    except Exception:
+        command = ""
+
+    if not command:
+        notify(f"No '{action_label}' action is available for the selected item.", xbmcgui.NOTIFICATION_WARNING)
+        finish_plugin_action()
+        return
+
+    try:
+        xbmc.executebuiltin(command)
+        log(f"Keyboard shortcut executed {action_label}: {command}", xbmc.LOGINFO)
+    except Exception as exc:
+        log(f"Keyboard shortcut failed for {action_label}: {exc}", xbmc.LOGERROR)
+        notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
+
+    finish_plugin_action()
+
+
+def add_track_item(
+    seed: str,
+    size: int,
+    index: int,
+    path: str,
+    cache_path: str = '',
+    metadata: dict | None = None,
+) -> None:
+    metadata = metadata if isinstance(metadata, dict) else get_track_metadata(path)
     mix_position = int(index) + 1
     title = metadata.get('title') or path_to_label(path)
     label = format_mix_track_label(path, metadata, mix_position)
@@ -3146,6 +3815,9 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
     more_like_this_action = build_more_like_this_action(seed, size, index, path, cache_path=cache_path)
     remove_action = build_remove_action(seed, size, index, path, cache_path=cache_path)
 
+    list_item.setProperty("MusicIP.MixAction.Remove", remove_action)
+    list_item.setProperty("MusicIP.MixAction.MoreLikeThis", more_like_this_action)
+
     context_items = [
         ("Refresh mix", refresh_action),
         ("More like this", more_like_this_action),
@@ -3153,7 +3825,10 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
 
     if index > 0:
         less_like_this_action = build_less_like_this_action(seed, size, index, path, cache_path=cache_path)
+        list_item.setProperty("MusicIP.MixAction.LessLikeThis", less_like_this_action)
         context_items.append(("Less like this", less_like_this_action))
+    else:
+        list_item.setProperty("MusicIP.MixAction.LessLikeThis", "")
 
     context_items.append(("Remove from mix", remove_action))
     list_item.addContextMenuItems(context_items)
@@ -3163,8 +3838,6 @@ def add_track_item(seed: str, size: int, index: int, path: str, cache_path: str 
         path=path,
     )
     xbmcplugin.addDirectoryItem(HANDLE, url, list_item, isFolder=False)
-
-
 
 def add_saved_mix_date_item(date_key: str, cache_paths: list[str]) -> None:
     count = len(cache_paths)
@@ -3632,9 +4305,17 @@ def discovery_mix_from_current() -> None:
     except Exception:
         pass
 
+    track_metadata_list = collect_mix_track_metadata(tracks, allow_live_lookup=False)
+
     try:
-        save_mix(seed, size, tracks)
-        play_tracks_as_music_playlist(tracks)
+        save_mix(seed, size, tracks, track_metadata_list=track_metadata_list)
+        enqueue_metadata_refresh_for_tracks(
+            tracks,
+            cache_path=mix_cache_path(seed, size),
+            metadata_list=track_metadata_list,
+            reason_context="discovery_mix_from_current",
+        )
+        play_tracks_as_music_playlist(tracks, track_metadata_list)
     except Exception as exc:
         notify(str(exc), xbmcgui.NOTIFICATION_ERROR)
         log(f"Discovery mix playback failed: {exc}", xbmc.LOGERROR)
@@ -3718,9 +4399,17 @@ def generate_current_mix() -> None:
         xbmcplugin.endOfDirectory(HANDLE, succeeded=True, cacheToDisc=False)
         return
 
+    track_metadata_list = collect_mix_track_metadata(tracks, allow_live_lookup=False)
+
     try:
-        save_mix(seed, size, tracks)
-        play_tracks_as_music_playlist(tracks)
+        save_mix(seed, size, tracks, track_metadata_list=track_metadata_list)
+        enqueue_metadata_refresh_for_tracks(
+            tracks,
+            cache_path=mix_cache_path(seed, size),
+            metadata_list=track_metadata_list,
+            reason_context="generate_current_mix",
+        )
+        play_tracks_as_music_playlist(tracks, track_metadata_list)
     except Exception as exc:
         message = str(exc)
         notify(message, xbmcgui.NOTIFICATION_ERROR)
@@ -3774,12 +4463,33 @@ def browse_mix(
         xbmcplugin.addDirectoryItem(HANDLE, "", info_item, isFolder=False)
     else:
         cache_path = mix_cache_path(seed, size)
+        meta = get_saved_mix_metadata(cache_path, tracks)
+        sidecar_map = build_sidecar_track_metadata_map(meta)
+        track_metadata_list = collect_mix_track_metadata(
+            tracks,
+            sidecar_map=sidecar_map,
+            allow_live_lookup=False,
+        )
+        set_mix_track_metadata_snapshot(cache_path, tracks, track_metadata_list)
+        enqueue_metadata_refresh_for_tracks(
+            tracks,
+            cache_path=cache_path,
+            metadata_list=track_metadata_list,
+            reason_context="browse_mix",
+        )
+
         for index, path in enumerate(tracks):
-            add_track_item(seed, size, index, path, cache_path=cache_path)
+            add_track_item(
+                seed,
+                size,
+                index,
+                path,
+                cache_path=cache_path,
+                metadata=track_metadata_list[index] if index < len(track_metadata_list) else None,
+            )
 
     xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing, cacheToDisc=False)
     apply_pending_focus(focus_index, focus_token)
-
 
 def browse_saved_mix(
     cache_path: str,
@@ -3812,6 +4522,7 @@ def browse_saved_mix(
             tracks = fetch_mix_confirmed(seed, size)
             save_mix(seed, size, tracks)
             cache_path = mix_cache_path(seed, size)
+            meta = get_saved_mix_metadata(cache_path, tracks)
         except MusicIPError as exc:
             notify(str(exc), xbmcgui.NOTIFICATION_WARNING if "cancelled" in str(exc).lower() else xbmcgui.NOTIFICATION_ERROR)
             log(str(exc), xbmc.LOGERROR)
@@ -3824,12 +4535,32 @@ def browse_saved_mix(
         apply_music_metadata(info_item, info_label)
         xbmcplugin.addDirectoryItem(HANDLE, "", info_item, isFolder=False)
     else:
+        sidecar_map = build_sidecar_track_metadata_map(meta)
+        track_metadata_list = collect_mix_track_metadata(
+            tracks,
+            sidecar_map=sidecar_map,
+            allow_live_lookup=False,
+        )
+        set_mix_track_metadata_snapshot(cache_path, tracks, track_metadata_list)
+        enqueue_metadata_refresh_for_tracks(
+            tracks,
+            cache_path=cache_path,
+            metadata_list=track_metadata_list,
+            reason_context="browse_saved_mix",
+        )
+
         for index, path in enumerate(tracks):
-            add_track_item(seed, size, index, path, cache_path=cache_path)
+            add_track_item(
+                seed,
+                size,
+                index,
+                path,
+                cache_path=cache_path,
+                metadata=track_metadata_list[index] if index < len(track_metadata_list) else None,
+            )
 
     xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing, cacheToDisc=False)
     apply_pending_focus(focus_index, focus_token)
-
 
 def format_sidecar_ts(value: object) -> str:
     try:
@@ -3975,17 +4706,28 @@ def apply_saved_mix_info_metadata(list_item: xbmcgui.ListItem, cache_path: str) 
         pass
 
 
-def play_tracks_as_music_playlist(tracks: list[str]) -> None:
+def play_tracks_as_music_playlist(
+    tracks: list[str],
+    track_metadata_list: list[dict] | None = None,
+) -> None:
     playable_tracks = [track for track in tracks if str(track or "").strip()]
     if not playable_tracks:
         raise MusicIPError("The generated mix contains no playable tracks.")
+
+    if not isinstance(track_metadata_list, list) or len(track_metadata_list) != len(playable_tracks):
+        track_metadata_list = collect_mix_track_metadata(playable_tracks, allow_live_lookup=False)
+        enqueue_metadata_refresh_for_tracks(
+            playable_tracks,
+            metadata_list=track_metadata_list,
+            reason_context="play_tracks_as_music_playlist",
+        )
 
     playlist = xbmc.PlayList(xbmc.PLAYLIST_MUSIC)
     playlist.clear()
 
     for index, track in enumerate(playable_tracks):
         mix_position = index + 1
-        metadata = get_track_metadata(track)
+        metadata = track_metadata_list[index] if index < len(track_metadata_list) else get_track_metadata(track)
         title = metadata.get("title") or path_to_label(track)
         label = format_mix_track_label(track, metadata, mix_position)
         list_item = xbmcgui.ListItem(label=label, offscreen=True)
@@ -4008,8 +4750,6 @@ def play_tracks_as_music_playlist(tracks: list[str]) -> None:
         playlist.add(track, list_item)
 
     xbmc.Player().play(playlist)
-
-
 
 def play_track(path: str) -> None:
     metadata = get_track_metadata(path)
@@ -4054,6 +4794,7 @@ def open_settings() -> None:
 
 
 def router() -> None:
+    ensure_musicip_keymap_installed()
     params = parse_args()
     action = params.get("action", "")
 
@@ -4071,6 +4812,18 @@ def router() -> None:
 
     if action == "mix_info_selected":
         show_selected_mix_info()
+        return
+
+    if action == "keyboard_remove_from_mix":
+        run_selected_mix_keyboard_action("MusicIP.MixAction.Remove", "Remove from mix")
+        return
+
+    if action == "keyboard_more_like_this":
+        run_selected_mix_keyboard_action("MusicIP.MixAction.MoreLikeThis", "More like this")
+        return
+
+    if action == "keyboard_less_like_this":
+        run_selected_mix_keyboard_action("MusicIP.MixAction.LessLikeThis", "Less like this")
         return
 
     if action == "discovery_mode":
