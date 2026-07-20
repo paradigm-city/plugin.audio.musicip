@@ -2001,8 +2001,45 @@ def prepend_seed_track(seed_song: str, tracks: list[str]) -> list[str]:
     return result
 
 
+def build_musicip_reload_url() -> str:
+    host = get_server_host()
+    port = get_server_port()
+    return f"http://{host}:{port}/server/reload"
+
+
+def reload_musicip_server_before_mix_generation() -> None:
+    url = build_musicip_reload_url()
+    timeout = get_timeout()
+
+    log(f"Requesting MusicIP server reload before mix generation: {url!r}")
+
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            try:
+                response.read()
+            except Exception:
+                pass
+    except HTTPError as exc:
+        try:
+            error_body = exc.read()
+        except Exception:
+            error_body = b""
+
+        log(f"MusicIP server reload HTTP error {exc.code}", xbmc.LOGERROR)
+        log(f"MusicIP server reload URL: {url!r}", xbmc.LOGERROR)
+        log(f"MusicIP server reload error body: {error_body!r}", xbmc.LOGERROR)
+        raise MusicIPError(f"MusicIP server reload returned HTTP {exc.code}.") from exc
+    except URLError as exc:
+        log(f"MusicIP server reload URL error for {url!r}: {exc}", xbmc.LOGERROR)
+        raise MusicIPError(f"Could not reload MusicIP server at {get_server_host()}:{get_server_port()}.") from exc
+    except Exception as exc:
+        log(f"MusicIP server reload failed for {url!r}: {exc}", xbmc.LOGERROR)
+        raise MusicIPError(f"MusicIP server reload failed: {exc}") from exc
+
+
 def fetch_mix(seed_song: str, size: int, mix_params: dict | None = None) -> list[str]:
     params = mix_params or get_effective_mix_parameters(size_override=size)
+    reload_musicip_server_before_mix_generation()
     url = build_musicip_url(seed_song, size, params)
     timeout = get_timeout()
 

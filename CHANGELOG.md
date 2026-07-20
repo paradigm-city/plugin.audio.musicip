@@ -1,5 +1,21 @@
 # CHANGELOG
 
+## Version 1.0.102
+
+- Added a MusicIP server reload before every mix generation request.
+- The add-on now calls:
+  - `/server/reload`
+- The reload is performed centrally inside `fetch_mix()`, before the `/api/mix` request is built and sent.
+- This applies to all mix generation routes:
+  - Generate mix from playing audio
+  - Refresh mix
+  - More like this
+  - Less like this
+  - Discovery-generated mixes
+  - keyboard/context-menu actions that trigger mix generation
+- If `/server/reload` fails, mix generation is aborted with a MusicIP error.
+- Existing 1.0.101 metadata selection-refresh behavior is preserved.
+
 ## Version 1.0.101
 
 - Changed phase 2 metadata presentation to refresh on selection movement.
