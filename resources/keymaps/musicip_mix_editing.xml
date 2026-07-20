@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<keymap>
+  <MyMusicNav>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </MyMusicNav>
+
+  <window10502>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </window10502>
+
+  <MusicPlaylist>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </MusicPlaylist>
+
+  <MusicFiles>
+    <keyboard>
+      <delete>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</delete>
+      <del>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_remove_from_mix)</del>
+      <m>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_more_like_this)</m>
+      <l>RunPlugin(plugin://plugin.audio.musicip/?action=keyboard_less_like_this)</l>
+    </keyboard>
+  </MusicFiles>
+</keymap>
